@@ -101,6 +101,27 @@ extern lv_obj_t *ui_SubMenu_Dial;
 extern lv_obj_t *ui_SubMenu_Rect;
 extern lv_obj_t *ui_SubMenu_Volume;
 extern lv_obj_t *ui_SelectionRect;  // 首页选中框
+// 蓝牙等待界面
+extern lv_obj_t *ui_WaitBtContainer;
+extern lv_obj_t *ui_WaitBtLabel;
+// 场景单词文本显示界面
+extern lv_obj_t *ui_SceneWordsContainer;
+extern lv_obj_t *ui_SceneWordsTitle;
+extern lv_obj_t *ui_SceneWordsText;
+extern lv_obj_t *ui_SceneWordsHint;
+// 英语对练页面
+extern lv_obj_t *ui_EnglishTalkContainer;
+extern lv_obj_t *ui_EnglishTalkTitle;
+extern lv_obj_t *ui_EnglishTalkStatus;
+extern lv_obj_t *ui_EnglishTalkTranscript;
+extern lv_obj_t *ui_EnglishTalkHint;
+// 拍照搜题页面
+extern lv_obj_t *ui_PhotoSearchContainer;
+extern lv_obj_t *ui_PhotoSearchTitle;
+extern lv_obj_t *ui_PhotoSearchStatus;
+extern lv_obj_t *ui_PhotoSearchCounter;
+extern lv_obj_t *ui_PhotoSearchPath;
+extern lv_obj_t *ui_PhotoSearchHint;
 // EVENTS
 extern lv_obj_t *ui____initial_actions0;
 
