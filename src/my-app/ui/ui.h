@@ -122,6 +122,10 @@ extern lv_obj_t *ui_PhotoSearchStatus;
 extern lv_obj_t *ui_PhotoSearchCounter;
 extern lv_obj_t *ui_PhotoSearchPath;
 extern lv_obj_t *ui_PhotoSearchHint;
+// 英语对练页面（第四张卡）
+extern lv_obj_t *ui_EnglishPracticeContainer;
+extern lv_obj_t *ui_EnglishPracticeTitle;
+extern lv_obj_t *ui_EnglishPracticeHint;
 // EVENTS
 extern lv_obj_t *ui____initial_actions0;
 
@@ -135,6 +139,10 @@ LV_FONT_DECLARE( ui_font_Font1);
 LV_FONT_DECLARE( ui_font_Font2);
 LV_FONT_DECLARE( ui_font_alibaba_48);
 LV_FONT_DECLARE( ui_font_alibaba_30);
+/* 数学/公式补充字体（从 DejaVuSansMono.ttf 生成，覆盖 Greek / 上下标 / 箭头 /
+ * 数学运算符 / 几何 / 补充数学符号等范围）。作为 ui_font_alibaba_30 的
+ * fallback：中文走 alibaba，≈/√/π/∑/≤/≥ 等走 DejaVu，避免"公式乱码方框"。*/
+LV_FONT_DECLARE( ui_font_math_30);
 // UI INIT
 void ui_init(void);
 

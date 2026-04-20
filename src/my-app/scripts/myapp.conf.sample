@@ -12,14 +12,14 @@
 # ============================================================
 
 # -------- 1) WiFi（开机后自动连接） --------
-wifi_ssid=mutong17pro
-wifi_password=12345678
+wifi_ssid=CU_Ahta
+wifi_password=xd39ad5z
 # 无线网卡名，一般不用改
 wifi_iface=wlan0
 
 # -------- 2) 算法服务地址（VLM / 翻译 / 拍照搜题 共用同一台服务器） --------
 # 把这里改成你自己的算法服务 IP，三个子服务端口按实际部署填写
-server_host=172.20.10.7
+server_host=192.168.1.7
 vlm_port=8002
 homework_port=8003
 translate_port=8004

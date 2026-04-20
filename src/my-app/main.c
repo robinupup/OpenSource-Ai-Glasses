@@ -5,7 +5,7 @@
  *   core/event_bus + core/gpio_hub  -> 按键事件
  *   core/waveguide                  -> 4bpp 直驱光波导显示
  *   LVGL (third_party/lvgl)         -> UI 框架
- *   ui/ui_Screen1.c                 -> 三方框 (场景单词 / 英语对练 / 拍照搜题)
+ *   ui/ui_Screen1.c                 -> 四方框 (场景单词 / 拟境英语 / 拍照搜题 / 英语对练)
  *
  * 拍照实现：完全对照 src/ffm_launcher/launch.cpp：
  *   - /dev/v4l-subdev2 设置 曝光=1300, 模拟增益=200
@@ -96,11 +96,12 @@
 #define PHOTO_DIR          "/userdata/myapp/photos"
 #define PHOTO_NV12_TMP     "/tmp/myapp_frame_nv12.raw"
 
-/* 首页三个选项 */
+/* 首页四个选项 */
 typedef enum {
-    HOME_SCENE  = 0,   /* 场景单词 */
-    HOME_TALK   = 1,   /* 英语对练 */
-    HOME_SEARCH = 2,   /* 拍照搜题 */
+    HOME_SCENE   = 0,   /* 场景单词 */
+    HOME_TALK    = 1,   /* 拟境英语（原英语对练，后端仍为 realtime_translate）*/
+    HOME_SEARCH  = 2,   /* 拍照搜题 */
+    HOME_ENGLISH = 3,   /* 英语对练（新增，后端待接入）*/
     HOME_COUNT
 } home_item_t;
 
@@ -177,16 +178,23 @@ static int lvgl_setup(void) {
 /* ==================== UI 控制 ==================== */
 static void update_home_highlight(int index) {
     if (!ui_SelectionRect) return;
-    static const int kXs[HOME_COUNT] = {5 - 4, 233 - 4, 461 - 4};
+    /* 与 ui_Screen1.c 中 BOX_X0=16、BOX_DX=156、BOX_Y=120 保持一致 */
+    static const int kXs[HOME_COUNT] = {
+        16  - 4,
+        172 - 4,
+        328 - 4,
+        484 - 4,
+    };
     if (index < 0 || index >= HOME_COUNT) return;
-    lv_obj_set_pos(ui_SelectionRect, kXs[index], 110 - 4);
+    lv_obj_set_pos(ui_SelectionRect, kXs[index], 120 - 4);
 }
 
 static void hide_all_function_pages(void) {
-    if (ui_subMenu)                lv_obj_add_flag(ui_subMenu,                LV_OBJ_FLAG_HIDDEN);
-    if (ui_SceneWordsContainer)    lv_obj_add_flag(ui_SceneWordsContainer,    LV_OBJ_FLAG_HIDDEN);
-    if (ui_EnglishTalkContainer)   lv_obj_add_flag(ui_EnglishTalkContainer,   LV_OBJ_FLAG_HIDDEN);
-    if (ui_PhotoSearchContainer)   lv_obj_add_flag(ui_PhotoSearchContainer,   LV_OBJ_FLAG_HIDDEN);
+    if (ui_subMenu)                  lv_obj_add_flag(ui_subMenu,                  LV_OBJ_FLAG_HIDDEN);
+    if (ui_SceneWordsContainer)      lv_obj_add_flag(ui_SceneWordsContainer,      LV_OBJ_FLAG_HIDDEN);
+    if (ui_EnglishTalkContainer)     lv_obj_add_flag(ui_EnglishTalkContainer,     LV_OBJ_FLAG_HIDDEN);
+    if (ui_PhotoSearchContainer)     lv_obj_add_flag(ui_PhotoSearchContainer,     LV_OBJ_FLAG_HIDDEN);
+    if (ui_EnglishPracticeContainer) lv_obj_add_flag(ui_EnglishPracticeContainer, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void show_home(void) {
@@ -502,9 +510,13 @@ typedef struct {
     lv_obj_t *status;
     lv_obj_t *tree_labels[3];
     lv_obj_t *crop_img;
+    /* 拍照搜题专用：整棵树渲染到 content（label 宽度超大+禁止折行），
+     * 外层 tree_wrap 负责裁剪和滚动；tree_cursor_rect 作为光标行高亮矩形。 */
+    lv_obj_t *tree_wrap;
+    lv_obj_t *tree_cursor_rect;
 } page_widgets_t;
 
-static page_widgets_t g_vlm_w, g_tr_w, g_hw_w;
+static page_widgets_t g_vlm_w, g_tr_w, g_hw_w, g_ep_w;
 
 static lv_obj_t *mk_label(lv_obj_t *parent, int y, lv_color_t color,
                           const lv_font_t *font) {
@@ -531,10 +543,63 @@ static void build_page_widgets(lv_obj_t *container, page_widgets_t *w,
                            &ui_font_alibaba_30);
 
     if (with_tree) {
-        for (int i = 0; i < 3; i++) {
-            w->tree_labels[i] = mk_label(container, 200 + i * 50,
-                                          lv_color_white(), &ui_font_alibaba_30);
-        }
+        /* 拍照搜题整体结构：
+         *   tree_wrap (600x300, 可纵向滚动)
+         *     ├─ tree_cursor_rect  灰色矩形，悬浮在光标行上 → "整行高亮"
+         *     └─ content label     整棵树的多行文本（禁止折行，宽度 1200
+         *                          避免 LVGL 自动 wrap；超宽部分被 wrap 裁剪）
+         * 不再使用 ▶ 箭头、recolor；光标高亮纯靠矩形定位。字数过多时
+         * app_ui_set_tree_cursor 调 lv_obj_scroll_to_view 让 wrap 跟随光标翻页。 */
+        lv_obj_del(w->content);   /* 换掉默认的 content label */
+
+        lv_obj_t *wrap = lv_obj_create(container);
+        lv_obj_set_pos(wrap, 20, 90);
+        lv_obj_set_size(wrap, 600, 300);
+        lv_obj_set_style_bg_opa(wrap, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(wrap, 0, 0);
+        lv_obj_set_style_pad_all(wrap, 0, 0);
+        lv_obj_set_style_radius(wrap, 0, 0);
+        /* 关键：LVGL 的 lv_obj_create 默认走 theme 里的 lv_font_default
+         * （通常是 montserrat_14，不含中文），子节点会通过 text_font 样式继承
+         * 拿到这个默认字体。把 wrap 的 text_font 显式设成 alibaba_30，
+         * 否则子 label 在还没生效 local style 之前会按默认字体找不到汉字 → 方框。*/
+        lv_obj_set_style_text_font(wrap, &ui_font_alibaba_30, 0);
+        lv_obj_set_style_text_color(wrap, lv_color_white(), 0);
+        lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLL_ELASTIC);
+        lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+        lv_obj_add_flag  (wrap, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(wrap, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(wrap, LV_SCROLLBAR_MODE_OFF);
+
+        /* 光标高亮矩形（先隐藏，收到数据后由 app_ui_set_tree_cursor 定位） */
+        lv_obj_t *rect = lv_obj_create(wrap);
+        lv_obj_set_size(rect, 600, 35);
+        lv_obj_set_pos(rect, 0, 0);
+        lv_obj_set_style_bg_color(rect, lv_color_make(90, 90, 90), 0);
+        lv_obj_set_style_bg_opa(rect, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(rect, 0, 0);
+        lv_obj_set_style_radius(rect, 4, 0);
+        lv_obj_set_style_pad_all(rect, 0, 0);
+        lv_obj_clear_flag(rect, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag  (rect, LV_OBJ_FLAG_HIDDEN);
+
+        /* 树文本 label：宽度给到 1200 让 LVGL 完全不 wrap，单行 = 单节点 */
+        lv_obj_t *tl = lv_label_create(wrap);
+        lv_label_set_long_mode(tl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_pos(tl, 0, 0);
+        lv_obj_set_width(tl, 1200);
+        lv_obj_set_style_text_color(tl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(tl, &ui_font_alibaba_30, 0);
+        lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_LEFT, 0);
+        lv_label_set_text(tl, "");
+
+        /* rect 放在 label 后方，让文字覆盖在高亮框之上（但灰色背景仍可见） */
+        lv_obj_move_background(rect);
+
+        w->content           = tl;
+        w->tree_wrap         = wrap;
+        w->tree_cursor_rect  = rect;
+        for (int i = 0; i < 3; i++) w->tree_labels[i] = NULL;
     }
     if (with_crop) {
         w->crop_img = lv_img_create(container);
@@ -550,7 +615,9 @@ static void install_app_ui(const page_widgets_t *w) {
     ui.content_label = w->content;
     ui.status_label  = w->status;
     for (int i = 0; i < 3; i++) ui.tree_labels[i] = w->tree_labels[i];
-    ui.crop_img = w->crop_img;
+    ui.crop_img          = w->crop_img;
+    ui.tree_wrap         = w->tree_wrap;
+    ui.tree_cursor_rect  = w->tree_cursor_rect;
     app_common_set_ui(&ui);
 }
 
@@ -561,18 +628,20 @@ static void ui_unlock_wrap(void) { pthread_mutex_unlock(&g_ui_mutex); }
 /* ==================== 功能进入/退出 ==================== */
 static const char *function_name(int idx) {
     switch (idx) {
-        case HOME_SCENE:  return "场景单词";
-        case HOME_TALK:   return "英语对练";
-        case HOME_SEARCH: return "拍照搜题";
-        default:          return "?";
+        case HOME_SCENE:   return "场景单词";
+        case HOME_TALK:    return "拟境英语";
+        case HOME_SEARCH:  return "拍照搜题";
+        case HOME_ENGLISH: return "英语对练";
+        default:           return "?";
     }
 }
 
 /*
  * 菜单与 lumina 子应用映射（按用户需求）：
- *   HOME_SCENE  (场景单词)  → 多模态百科 (vlm_talking    :8002)
- *   HOME_TALK   (英语对练)  → 实时翻译   (realtime_translate :8004)
- *   HOME_SEARCH (拍照搜题)  → 拍照搜题   (homework_finding   :8003)
+ *   HOME_SCENE   (场景单词)  → 多模态百科 (vlm_talking    :8002)
+ *   HOME_TALK    (拟境英语)  → 实时翻译   (realtime_translate :8004)
+ *   HOME_SEARCH  (拍照搜题)  → 拍照搜题   (homework_finding   :8003)
+ *   HOME_ENGLISH (英语对练)  → 后端待接入，目前仅显示页面标题与退出提示
  */
 
 typedef struct {
@@ -654,15 +723,19 @@ static void *longpress_thread_main(void *arg) {
     (void)arg;
     while (g_lp_running) {
         uint64_t t = g_t1_press_ms;
-        if (t != 0) {
-            if (g_app_state != APP_STATE_HOME) {
-                g_t1_press_ms = 0;
-            } else if (now_ms() - t >= LONG_PRESS_MS) {
-                g_t1_press_ms = 0;   /* release 看到 0 就不再当短按处理 */
+        if (t != 0 && now_ms() - t >= LONG_PRESS_MS) {
+            g_t1_press_ms = 0;   /* release 看到 0 就不再当短按处理 */
+            if (g_app_state == APP_STATE_HOME) {
                 pthread_mutex_lock(&g_ui_mutex);
                 int idx = g_menu_index;
                 pthread_mutex_unlock(&g_ui_mutex);
                 enter_function(idx);
+            } else {
+                /* 功能内长按：派发给 app，例如拍照搜题 = expand */
+                int idx = g_active_function;
+                if (idx >= 0 && idx < HOME_COUNT && g_apps[idx].t1_long) {
+                    g_apps[idx].t1_long();
+                }
             }
         }
         usleep(10 * 1000);
@@ -676,11 +749,11 @@ static void on_gpio_press(const event_t *evt, void *user_data) {
     const gpio_event_payload_t *p = (const gpio_event_payload_t *)evt->payload;
     printf("[app] GPIO%d PRESS (state=%d)\n", p->gpio, (int)g_app_state);
 
-    if (p->gpio == GPIO_NAV) {            /* 触摸板 1 按下：开始长按计时 */
-        if (g_app_state == APP_STATE_HOME) {
-            uint64_t n = now_ms();
-            g_t1_press_ms = (n == 0 ? 1 : n);
-        }
+    if (p->gpio == GPIO_NAV) {            /* 触摸板 1 按下：开始长按计时
+                                           * 首页 & 功能内都需要计时——长按线程
+                                           * 会按当前 app_state 派发到不同动作。 */
+        uint64_t n = now_ms();
+        g_t1_press_ms = (n == 0 ? 1 : n);
         return;
     }
 
@@ -703,22 +776,31 @@ static void on_gpio_release(const event_t *evt, void *user_data) {
            p->gpio, dur, (int)g_app_state);
 
     if (p->gpio == GPIO_NAV) {            /* 触摸板 1 抬起 */
-        if (g_app_state != APP_STATE_HOME) { g_t1_press_ms = 0; return; }
         uint64_t t = g_t1_press_ms;
         g_t1_press_ms = 0;
         if (t == 0) return;                /* 长按已在 poll 里触发，这里忽略 */
-        if (dur >= LONG_PRESS_MS) {
-            /* 兜底：主循环调度晚于 release 时（极端情况），这里仍按长按处理 */
-            pthread_mutex_lock(&g_ui_mutex);
-            int idx = g_menu_index;
-            pthread_mutex_unlock(&g_ui_mutex);
-            enter_function(idx);
+
+        int is_long = (dur >= LONG_PRESS_MS);
+        if (g_app_state == APP_STATE_HOME) {
+            if (is_long) {
+                pthread_mutex_lock(&g_ui_mutex);
+                int idx = g_menu_index;
+                pthread_mutex_unlock(&g_ui_mutex);
+                enter_function(idx);
+            } else {
+                pthread_mutex_lock(&g_ui_mutex);
+                g_menu_index = (g_menu_index + 1) % HOME_COUNT;
+                update_home_highlight(g_menu_index);
+                pthread_mutex_unlock(&g_ui_mutex);
+            }
         } else {
-            /* 短按：翻页 */
-            pthread_mutex_lock(&g_ui_mutex);
-            g_menu_index = (g_menu_index + 1) % HOME_COUNT;
-            update_home_highlight(g_menu_index);
-            pthread_mutex_unlock(&g_ui_mutex);
+            /* 功能内：短按→t1_short（拍照搜题=下移一行）；长按兜底→t1_long */
+            int idx = g_active_function;
+            if (idx >= 0 && idx < HOME_COUNT) {
+                void (*cb)(void) = is_long ? g_apps[idx].t1_long
+                                           : g_apps[idx].t1_short;
+                if (cb) cb();
+            }
         }
         return;
     }
@@ -769,9 +851,10 @@ int main(int argc, char **argv) {
     show_home();
 
     /* --- 构建功能页附加控件，并完成 lumina 子应用绑定 --- */
-    build_page_widgets(ui_SceneWordsContainer,  &g_vlm_w, /*crop*/1, /*tree*/0);
-    build_page_widgets(ui_EnglishTalkContainer, &g_tr_w,  0, 0);
-    build_page_widgets(ui_PhotoSearchContainer, &g_hw_w,  0, 1);
+    build_page_widgets(ui_SceneWordsContainer,      &g_vlm_w, /*crop*/1, /*tree*/0);
+    build_page_widgets(ui_EnglishTalkContainer,     &g_tr_w,  0, 0);
+    build_page_widgets(ui_PhotoSearchContainer,     &g_hw_w,  0, 1);
+    build_page_widgets(ui_EnglishPracticeContainer, &g_ep_w,  0, 0);
 
     app_common_bind_lock(ui_lock_wrap, ui_unlock_wrap);
 
@@ -781,7 +864,7 @@ int main(int argc, char **argv) {
         lv_obj_set_pos(mic_lbl, 10, 6);
         lv_obj_set_style_text_font(mic_lbl, &ui_font_alibaba_30, 0);
         lv_obj_set_style_text_color(mic_lbl, lv_color_make(150, 150, 150), 0);
-        lv_label_set_text(mic_lbl, "收音：关");
+        lv_label_set_text(mic_lbl, "收音:关");
         app_common_set_mic_indicator(mic_lbl);
     }
 
@@ -809,7 +892,7 @@ int main(int argc, char **argv) {
         .t1_long  = NULL,
         .widgets  = &g_tr_w,
         .container= ui_EnglishTalkContainer,
-        .title    = "实时翻译" };
+        .title    = "拟境英语" };
     /* 拍照搜题专属：T1 短按=光标下移，T1 长按=展开当前节点 */
     g_apps[HOME_SEARCH] = (app_entry_t){
         .enter    = app_homework_enter,
@@ -820,6 +903,18 @@ int main(int argc, char **argv) {
         .widgets  = &g_hw_w,
         .container= ui_PhotoSearchContainer,
         .title    = "拍照搜题" };
+    /* 英语对练：后端待接入。enter/exit/confirm 全为 NULL，
+     * enter_function 进入时只会切页面，不会调用任何业务回调，
+     * 因此不会崩；install_app_ui 使用 g_ep_w（空 label）。 */
+    g_apps[HOME_ENGLISH] = (app_entry_t){
+        .enter    = NULL,
+        .exit     = NULL,
+        .confirm  = NULL,
+        .t1_short = NULL,
+        .t1_long  = NULL,
+        .widgets  = &g_ep_w,
+        .container= ui_EnglishPracticeContainer,
+        .title    = "英语对练" };
 
     if (gpio_hub_init() == 0) {
         gpio_hub_add(GPIO_ACT, GPIO_ACTIVE_LOW);

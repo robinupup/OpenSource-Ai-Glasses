@@ -32,7 +32,11 @@ typedef struct {
     /* vlm */
     lv_obj_t *crop_img;
     /* homework */
-    lv_obj_t *tree_labels[3];
+    lv_obj_t *tree_labels[3];      /* 旧接口保留；已不再使用 */
+    /* 拍照搜题专用：整棵树渲染到一个 label，内嵌进可滚动容器 tree_wrap；
+     * tree_cursor_rect 作为悬浮矩形覆盖在光标行，实现"整行高亮"。 */
+    lv_obj_t *tree_wrap;
+    lv_obj_t *tree_cursor_rect;
 } app_ui_t;
 
 /** 装配 UI 句柄（在主线程里调一次即可）。 */
@@ -62,6 +66,13 @@ void app_ui_show_crop_b64_jpeg(const char *b64);
 
 /** 便捷：homework 第一层节点。最多 3 个；为 NULL 的格子置空。 */
 void app_ui_set_tree_layer1(const char *n0, const char *n1, const char *n2);
+
+/**
+ * 拍照搜题：把光标高亮矩形定位到 content_label 的第 line_idx 行（0-based），
+ * 并把 tree_wrap 滚动到让该矩形可见。line_idx < 0 时隐藏矩形（无光标）。
+ * 线程安全（内部自动 app_ui_lock）。
+ */
+void app_ui_set_tree_cursor(int line_idx);
 
 /**
  * 收音状态指示器（左上角常驻 label，由 main.c 创建后注册）。

@@ -218,6 +218,27 @@ void app_ui_set_tree_layer1(const char *n0, const char *n1, const char *n2) {
     }
 }
 
+void app_ui_set_tree_cursor(int line_idx) {
+    app_ui_lock();
+    lv_obj_t *rect = g_ui.tree_cursor_rect;
+    lv_obj_t *lbl  = g_ui.content_label;
+    if (rect && lbl) {
+        if (line_idx < 0) {
+            lv_obj_add_flag(rect, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            const lv_font_t *f = lv_obj_get_style_text_font(lbl, LV_PART_MAIN);
+            int lh = f ? (int)lv_font_get_line_height(f) : 35;
+            /* 矩形宽度跟随 tree_wrap；高度 = 字体行高 */
+            lv_obj_set_pos(rect, 0, line_idx * lh);
+            lv_obj_set_height(rect, lh);
+            lv_obj_clear_flag(rect, LV_OBJ_FLAG_HIDDEN);
+            /* 让矩形进入可视区——字数过多时容器自动滚动。 */
+            lv_obj_scroll_to_view(rect, LV_ANIM_OFF);
+        }
+    }
+    app_ui_unlock();
+}
+
 void app_common_set_mic_indicator(lv_obj_t *label) {
     g_mic_indicator = label;
     app_common_set_mic_on(0);
@@ -226,7 +247,9 @@ void app_common_set_mic_indicator(lv_obj_t *label) {
 void app_common_set_mic_on(int on) {
     if (!g_mic_indicator) return;
     app_ui_lock();
-    lv_label_set_text(g_mic_indicator, on ? "收音：开" : "收音：关");
+    /* 用 ASCII 冒号：Alibaba / DejaVu 两个字体都不包含全角冒号 U+FF1A，
+     * 之前显示成空方块。后续 UI 可视字符串都应尽量避免 0xFF00-0xFFEF 范围。 */
+    lv_label_set_text(g_mic_indicator, on ? "收音:开" : "收音:关");
     lv_obj_set_style_text_color(g_mic_indicator,
         on ? lv_color_make(255, 96, 96) : lv_color_make(150, 150, 150), 0);
     app_ui_unlock();

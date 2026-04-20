@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 /* 状态机：
  *   IDLE   空闲；按电源键 → 拍照 + 建 uuid + 开录音 → REC
@@ -51,9 +52,15 @@ static void set_status(const char *s) {
 }
 
 static void refresh_tree_display(void) {
-    /* 树渲染到 content_label；在 UI 结构中它是中间多行区域。 */
-    hw_tree_render(g_tree, g_cursor, g_render_buf, sizeof(g_render_buf));
+    /* 1) 渲染纯文本树；cursor_line 为光标所在 0-based 行号（-1 表示没光标）
+     * 2) 把文本写到 content_label
+     * 3) 让 UI 层把高亮矩形定位到光标行，并滚动到可视区——字数过多时
+     *    content label 被 tree_wrap 裁剪，光标会始终保持在屏幕内。*/
+    int cursor_line = -1;
+    hw_tree_render(g_tree, g_cursor, g_render_buf, sizeof(g_render_buf),
+                   &cursor_line);
     app_ui_set_text(app_common_get_ui()->content_label, g_render_buf);
+    app_ui_set_tree_cursor(cursor_line);
 }
 
 static void reset_tree(void) {
@@ -67,9 +74,39 @@ static void reset_tree(void) {
 
 static void stop_mic(void);
 
+/* PCM 发送统计：每 1s 打印一次字节数和帧数。
+ * 排查"算法服务没有 ASR 返回"时关键——肉眼即可判断麦克风是否在产出、
+ * 以及本轮停麦前累计发了多少音频。translate/vlm 也可以按需加同款统计。*/
 static void on_pcm(const uint8_t *data, size_t len, void *ud) {
     (void)ud;
-    if (g_ws && ws_client_is_open(g_ws)) ws_client_send_binary(g_ws, data, len);
+    static uint64_t win_start_ms = 0;
+    static uint64_t win_bytes = 0;
+    static uint32_t win_frames = 0;
+    static uint64_t round_bytes = 0;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+    if (win_start_ms == 0) { win_start_ms = now; round_bytes = 0; }
+
+    int ws_up = (g_ws && ws_client_is_open(g_ws));
+    if (ws_up) {
+        ws_client_send_binary(g_ws, data, len);
+        win_bytes   += len;
+        win_frames  += 1;
+        round_bytes += len;
+    }
+
+    if (now - win_start_ms >= 1000) {
+        printf("[homework] PCM tx: %u frames, %llu B/s, round_total=%llu B, ws=%d\n",
+               win_frames,
+               (unsigned long long)win_bytes,
+               (unsigned long long)round_bytes,
+               ws_up);
+        win_start_ms = now;
+        win_bytes = 0;
+        win_frames = 0;
+    }
 }
 
 /*
@@ -95,6 +132,7 @@ static void handle_json(const char *text, size_t len) {
             reset_tree();
             pthread_mutex_unlock(&g_lock);
             app_ui_clear_text(app_common_get_ui()->content_label);
+            app_ui_set_tree_cursor(-1);
             app_ui_show_asr(jtxt->valuestring);
         }
 
@@ -120,10 +158,11 @@ static void handle_json(const char *text, size_t len) {
             pthread_mutex_lock(&g_lock);
             hw_node_t *parent = NULL;
             if (g_expand_target) {
-                /* 强制转常量到可写：tree 内部结构由本模块独占，安全 */
                 parent = (hw_node_t *)g_expand_target;
+                /* 清掉占位的"查询中..."节点（也清掉旧的展开结果，防重复） */
+                hw_tree_clear_children(parent);
             } else {
-                parent = g_tree;  /* 挂到虚拟根（顶层） */
+                parent = g_tree;
             }
             int before = parent ? parent->child_count : 0;
             int added  = hw_tree_load_json_into(parent, json_for_load);
@@ -148,7 +187,7 @@ static void handle_json(const char *text, size_t len) {
         g_expand_target = NULL;   /* expand 也经由 done 收尾 */
         pthread_mutex_unlock(&g_lock);
         if (after != ST_REC) {
-            set_status("电源键 收音 · T1 短=下移 长=展开 · T2 退出");
+            set_status("电源键 收音 · T1 单击 换页 · T1 长按 展开 · T2 退出");
         }
 
     } else if (strcmp(type, "error") == 0) {
@@ -158,8 +197,13 @@ static void handle_json(const char *text, size_t len) {
                  cJSON_IsString(jd) ? jd->valuestring : "?");
         set_status(buf);
         pthread_mutex_lock(&g_lock);
+        int had_placeholder = (g_expand_target != NULL);
+        if (had_placeholder) {
+            hw_tree_clear_children((hw_node_t *)g_expand_target);
+        }
         g_expand_target = NULL;
         pthread_mutex_unlock(&g_lock);
+        if (had_placeholder) refresh_tree_display();
     }
 
     cJSON_Delete(root);
@@ -169,7 +213,7 @@ static void on_ws(ws_event_t ev, ws_msg_type_t type, const void *data,
                   size_t len, void *ud) {
     (void)ud;
     if (ev == WS_EV_OPEN) {
-        set_status("电源键 收音 · T1 短=下移 长=展开 · T2 退出");
+        set_status("电源键 收音 · T1 单击 换页 · T1 长按 展开 · T2 退出");
     } else if (ev == WS_EV_MSG) {
         if (type == WS_MSG_TEXT) handle_json((const char *)data, len);
     } else if (ev == WS_EV_CLOSE) {
@@ -177,7 +221,7 @@ static void on_ws(ws_event_t ev, ws_msg_type_t type, const void *data,
         g_state = ST_IDLE;
         g_expand_target = NULL;
         pthread_mutex_unlock(&g_lock);
-        set_status("○ 连接已断开（按键将自动重连）");
+        set_status("○ 连接已断开(按键将自动重连)");
     } else if (ev == WS_EV_ERROR) {
         set_status("✕ 连接错误");
     }
@@ -212,6 +256,7 @@ static void start_round(void) {
     reset_tree();
     pthread_mutex_unlock(&g_lock);
     app_ui_set_text(ui->content_label, "");
+    app_ui_set_tree_cursor(-1);   /* 新一轮：光标还没数据，先把高亮矩形隐掉 */
     set_status("○ 拍照中…");
 
     char jpeg_path[256] = {0};
@@ -246,7 +291,7 @@ static void start_round(void) {
     g_mic = mic_pump_start(&p, 1280, on_pcm, NULL);
     if (!g_mic) { set_status("✕ 麦克风启动失败"); return; }
     app_common_set_mic_on(1);
-    set_status("● 录音中（电源键=关）");
+    set_status("● 录音中(电源键=关)");
 }
 
 static void stop_mic(void) {
@@ -262,6 +307,7 @@ void app_homework_enter(void) {
     const app_ui_t *ui = app_common_get_ui();
     app_ui_hide_asr();
     app_ui_set_text(ui->content_label, "按电源键开始拍照 / 收音");
+    app_ui_set_tree_cursor(-1);   /* 刚进入功能，没有光标行 → 隐藏高亮矩形 */
     set_status("○ 连接中…");
     ensure_ws_open();
 }
@@ -283,17 +329,20 @@ void app_homework_on_confirm(void) {
     pthread_mutex_unlock(&g_lock);
 
     if (s != ST_REC) {
-        start_round();
+        /* 先把状态切过去，避免 start_round 期间（拍照+base64+send image 合计 1~2s）
+         * 电源键再次按下被误判为"第一次按"导致重入 start_round。 */
         pthread_mutex_lock(&g_lock);
         g_state = ST_REC;
         pthread_mutex_unlock(&g_lock);
+        start_round();
     } else {
         stop_mic();
         if (g_ws) ws_client_send_text(g_ws, "{\"type\":\"mic\",\"value\":\"off\"}");
         pthread_mutex_lock(&g_lock);
         g_state = ST_WAIT;
         pthread_mutex_unlock(&g_lock);
-        set_status("⏳ 搜题中…");
+        printf("[homework] mic off 已发，进入 WAIT；请观察服务端是否收到足量 PCM 字节\n");
+        set_status("… 搜题中");
     }
 }
 
@@ -315,12 +364,20 @@ void app_homework_on_act_expand(void) {
 
     if (!target || !target->label) { set_status("✕ 请先按电源键拍照搜题"); return; }
     if (!ws_ok) { set_status("✕ WS 未就绪，无法展开"); return; }
-    if (busy)   { set_status("⏳ 请稍候，上一轮尚未结束"); return; }
+    if (busy)   { set_status("… 请稍候，上一轮尚未结束"); return; }
 
-    /* 记录期待挂点，响应回来后由 handle_json 挂到这里 */
+    /* 记录期待挂点，响应回来后由 handle_json 挂到这里；同时插入一个
+     * "查询中..." 占位子节点，让用户立即看到"展开已发起"。收到 content
+     * 时先 clear_children 再 load，占位节点自然被覆盖。 */
     pthread_mutex_lock(&g_lock);
     g_expand_target = target;
+    hw_node_t *wtarget = (hw_node_t *)target;
+    wtarget->is_folded = 0;   /* 展开前强制解折叠，否则子节点不渲染 */
+    hw_tree_clear_children(wtarget);
+    hw_tree_load_json_into(wtarget,
+        "{\"children\":[{\"label\":\"查询中...\"}]}");
     pthread_mutex_unlock(&g_lock);
+    refresh_tree_display();
 
     /* 构造 expand 消息（与 x_engine/photo_search/serve.py 对齐）：
      *   客户端 → 服务端 : {"type":"expand","value":"<leaf_label>","data":"<uuid>"}
@@ -348,11 +405,16 @@ void app_homework_on_act_expand(void) {
     free(m);
 
     if (rc != 0) {
+        /* 发送失败：移除刚挂上去的"查询中..."占位 */
         pthread_mutex_lock(&g_lock);
+        if (g_expand_target) {
+            hw_tree_clear_children((hw_node_t *)g_expand_target);
+        }
         g_expand_target = NULL;
         pthread_mutex_unlock(&g_lock);
+        refresh_tree_display();
         set_status("✕ 展开请求发送失败");
         return;
     }
-    set_status("⏳ 正在展开…");
+    set_status("… 正在展开");
 }

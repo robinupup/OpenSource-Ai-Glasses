@@ -10,11 +10,14 @@
  #include "lvgl/lvgl.h"
  #endif
  
- #ifndef UI_FONT_ALIBABA_30
- #define UI_FONT_ALIBABA_30 1
- #endif
- 
- #if UI_FONT_ALIBABA_30
+#ifndef UI_FONT_ALIBABA_30
+#define UI_FONT_ALIBABA_30 1
+#endif
+
+#if UI_FONT_ALIBABA_30
+
+/* 公式 fallback 字体（见末尾 .fallback 字段） */
+LV_FONT_DECLARE(ui_font_math_30);
  
  /*-----------------
   *    BITMAPS
@@ -58325,15 +58328,18 @@
      .underline_position = -2,
      .underline_thickness = 2,
  #endif
-     .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
- #if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
-     .fallback = NULL,
- #endif
-     .user_data = NULL,
- };
- 
- 
- 
- #endif /*#if UI_FONT_ALIBABA_30*/
+    .dsc = &font_dsc,          /*The custom font data. Will be accessed by `get_glyph_bitmap/dsc` */
+#if LV_VERSION_CHECK(8, 2, 0) || LVGL_VERSION_MAJOR >= 9
+    /* 回退到 ui_font_math_30（DejaVuSansMono 生成）用于数学/希腊/箭头等
+     * alibaba 不覆盖的字符——修复拍照搜题公式乱码。手工加入，重新生成字体
+     * 时请一并保留。 */
+    .fallback = &ui_font_math_30,
+#endif
+    .user_data = NULL,
+};
+
+
+
+#endif /*#if UI_FONT_ALIBABA_30*/
  
  

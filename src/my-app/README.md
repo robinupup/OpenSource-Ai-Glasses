@@ -120,7 +120,7 @@ translate_port=8004         # 实时翻译
 ```bash
 make deploy-conf
 adb shell /oem/usr/bin/app_switch.sh stop
-adb shell /oem/usr/bin/app_switch.sh myapp
+adb shell /oem/usr/bin/app_switch.sh myapp -f
 ```
 
 **方式 B（临时调试）**：直接在眼镜上改：

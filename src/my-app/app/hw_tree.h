@@ -48,6 +48,10 @@ int hw_tree_is_empty(const hw_node_t *root);
  */
 int hw_tree_load_json_into(hw_node_t *parent, const char *json_str);
 
+/** 清掉 parent 下所有子节点（递归 free），parent 本身保留。
+ *  用于 expand 响应到达时清理占位节点 / 旧的展开结果。 */
+void hw_tree_clear_children(hw_node_t *parent);
+
 /**
  * 按深度优先顺序收集"可见"节点（祖先都未 folded）。
  * 不包含 root 自身。
@@ -66,16 +70,15 @@ const hw_node_t *hw_tree_next_visible(const hw_node_t *root,
 
 /**
  * 把整棵树渲染为多行字符串写入 [buf]（最多 cap-1 字节，保证 NUL 结尾）。
- * 规则：
- *   - 每层缩进 2 个空格
- *   - cursor 节点前缀 "▶ "；其它为 "• "
- *   - 折叠节点显示 "〈label〉 …"（不递归子节点）
- *   - 流式/加载中由上层自行追加 "…" 提示
+ * 纯文本输出：无光标箭头、无颜色标记。所有节点用 Box Drawing 连接符
+ * （├─ └─ │）呈现层级；光标行由调用方通过悬浮矩形实现"整行高亮"。
  *
+ * @param out_cursor_line 非空时，写入 cursor 所在的 0-based 行号；若 cursor
+ *                        为 NULL 或未命中，写 -1。调用方据此定位高亮矩形。
  * @return 实际写入字节数（不含结尾 NUL）
  */
 size_t hw_tree_render(const hw_node_t *root, const hw_node_t *cursor,
-                      char *buf, size_t cap);
+                      char *buf, size_t cap, int *out_cursor_line);
 
 #ifdef __cplusplus
 }

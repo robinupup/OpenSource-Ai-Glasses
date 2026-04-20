@@ -122,7 +122,7 @@ static void on_ws(ws_event_t ev, ws_msg_type_t type, const void *data,
         pthread_mutex_lock(&g_lock);
         g_state = ST_IDLE;
         pthread_mutex_unlock(&g_lock);
-        set_status("○ 连接已断开（按键将自动重连）");
+        set_status("○ 连接已断开(按键将自动重连)");
     } else if (ev == WS_EV_ERROR) {
         set_status("✕ 连接错误");
     }
@@ -166,7 +166,7 @@ static void start_round(void) {
     g_mic = mic_pump_start(&p, 1280, on_pcm, NULL);
     if (!g_mic) { set_status("✕ 麦克风启动失败"); return; }
     app_common_set_mic_on(1);
-    set_status("● 录音中（电源键 关）");
+    set_status("● 录音中(电源键 关)");
 }
 
 static void stop_mic(void) {
@@ -209,6 +209,6 @@ void app_vlm_on_confirm(void) {
         pthread_mutex_lock(&g_lock);
         g_state = ST_WAIT;
         pthread_mutex_unlock(&g_lock);
-        set_status("⏳ 识别中…（电源键再按开始新一轮）");
+        set_status("… 识别中(电源键再按开始新一轮)");
     }
 }

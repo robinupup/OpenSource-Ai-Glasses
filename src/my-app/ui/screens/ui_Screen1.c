@@ -48,7 +48,7 @@ lv_obj_t *ui_SceneWordsTitle = NULL;
 lv_obj_t *ui_SceneWordsText = NULL;
 lv_obj_t *ui_SceneWordsHint = NULL;
 
-// 英语对练界面
+// 拟境英语界面（原"英语对练"，复用 EnglishTalk* 符号名以兼容外部）
 lv_obj_t *ui_EnglishTalkContainer = NULL;
 lv_obj_t *ui_EnglishTalkTitle = NULL;
 lv_obj_t *ui_EnglishTalkStatus = NULL;
@@ -62,6 +62,11 @@ lv_obj_t *ui_PhotoSearchStatus = NULL;
 lv_obj_t *ui_PhotoSearchCounter = NULL;
 lv_obj_t *ui_PhotoSearchPath = NULL;
 lv_obj_t *ui_PhotoSearchHint = NULL;
+
+// 英语对练界面（第四张卡，新增）
+lv_obj_t *ui_EnglishPracticeContainer = NULL;
+lv_obj_t *ui_EnglishPracticeTitle = NULL;
+lv_obj_t *ui_EnglishPracticeHint = NULL;
 
 /* ---- 功能页通用样式参数（灰阶，适配光波导 4bpp） ---- */
 #define PAGE_W              640
@@ -152,18 +157,21 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_border_width(ui_VideoContainer, 0, 0);
     lv_obj_clear_flag(ui_VideoContainer, LV_OBJ_FLAG_SCROLLABLE);
 
-    #define BOX_W 173
-    #define BOX_H 200
-    #define BOX_Y 110
+    /* 首页四项布局：
+     *   - 屏幕宽 640，外边距 16，卡片宽 140，间距 16
+     *   - 位置 x：16, 172, 328, 484 （末端 484+140=624，右边距 16）*/
+    #define BOX_W 140
+    #define BOX_H 190
+    #define BOX_Y 120
+    #define BOX_X0 16
+    #define BOX_DX 156      /* BOX_W + 间距 = 140 + 16 */
     #define BOX_RADIUS 16
     #define BOX_BORDER 3
-
-    /* 首页三项：恢复白色圆角外框 */
 
     // --- 框1: 场景单词 ---
     lv_obj_t *box1 = lv_obj_create(ui_VideoContainer);
     lv_obj_set_size(box1, BOX_W, BOX_H);
-    lv_obj_set_pos(box1, 5, BOX_Y);
+    lv_obj_set_pos(box1, BOX_X0 + 0 * BOX_DX, BOX_Y);
     lv_obj_set_style_bg_opa(box1, 0, 0);
     lv_obj_set_style_border_width(box1, BOX_BORDER, 0);
     lv_obj_set_style_border_color(box1, lv_color_white(), 0);
@@ -178,10 +186,10 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_line_space(ui_CameraText, 8, 0);
     lv_obj_center(ui_CameraText);
 
-    // --- 框2: 英语对练 ---
+    // --- 框2: 拟境英语 ---
     lv_obj_t *box2 = lv_obj_create(ui_VideoContainer);
     lv_obj_set_size(box2, BOX_W, BOX_H);
-    lv_obj_set_pos(box2, 233, BOX_Y);
+    lv_obj_set_pos(box2, BOX_X0 + 1 * BOX_DX, BOX_Y);
     lv_obj_set_style_bg_opa(box2, 0, 0);
     lv_obj_set_style_border_width(box2, BOX_BORDER, 0);
     lv_obj_set_style_border_color(box2, lv_color_white(), 0);
@@ -189,7 +197,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_clear_flag(box2, LV_OBJ_FLAG_SCROLLABLE);
 
     ui_VideoText = lv_label_create(box2);
-    lv_label_set_text(ui_VideoText, "英语\n对练");
+    lv_label_set_text(ui_VideoText, "拟境\n英语");
     lv_obj_set_style_text_font(ui_VideoText, &ui_font_alibaba_48, 0);
     lv_obj_set_style_text_color(ui_VideoText, lv_color_white(), 0);
     lv_obj_set_style_text_align(ui_VideoText, LV_TEXT_ALIGN_CENTER, 0);
@@ -199,7 +207,7 @@ void ui_Screen1_screen_init(void)
     // --- 框3: 拍照搜题 ---
     lv_obj_t *box3 = lv_obj_create(ui_VideoContainer);
     lv_obj_set_size(box3, BOX_W, BOX_H);
-    lv_obj_set_pos(box3, 461, BOX_Y);
+    lv_obj_set_pos(box3, BOX_X0 + 2 * BOX_DX, BOX_Y);
     lv_obj_set_style_bg_opa(box3, 0, 0);
     lv_obj_set_style_border_width(box3, BOX_BORDER, 0);
     lv_obj_set_style_border_color(box3, lv_color_white(), 0);
@@ -214,6 +222,24 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_style_text_line_space(ui_MoreText, 8, 0);
     lv_obj_center(ui_MoreText);
 
+    // --- 框4: 英语对练（新增）---
+    lv_obj_t *box4 = lv_obj_create(ui_VideoContainer);
+    lv_obj_set_size(box4, BOX_W, BOX_H);
+    lv_obj_set_pos(box4, BOX_X0 + 3 * BOX_DX, BOX_Y);
+    lv_obj_set_style_bg_opa(box4, 0, 0);
+    lv_obj_set_style_border_width(box4, BOX_BORDER, 0);
+    lv_obj_set_style_border_color(box4, lv_color_white(), 0);
+    lv_obj_set_style_radius(box4, BOX_RADIUS, 0);
+    lv_obj_clear_flag(box4, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *box4_text = lv_label_create(box4);
+    lv_label_set_text(box4_text, "英语\n对练");
+    lv_obj_set_style_text_font(box4_text, &ui_font_alibaba_48, 0);
+    lv_obj_set_style_text_color(box4_text, lv_color_white(), 0);
+    lv_obj_set_style_text_align(box4_text, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(box4_text, 8, 0);
+    lv_obj_center(box4_text);
+
     // --- 首页底部操作说明 ---
     lv_obj_t *home_hint = lv_label_create(ui_VideoContainer);
     lv_label_set_text(home_hint,
@@ -226,7 +252,7 @@ void ui_Screen1_screen_init(void)
     // --- 选中框（首页唯一的圆角框，做当前选中高亮） ---
     ui_SelectionRect = lv_obj_create(ui_VideoContainer);
     lv_obj_set_size(ui_SelectionRect, BOX_W + 8, BOX_H + 8);
-    lv_obj_set_pos(ui_SelectionRect, 5 - 4, BOX_Y - 4);
+    lv_obj_set_pos(ui_SelectionRect, BOX_X0 - 4, BOX_Y - 4);
     lv_obj_set_style_bg_opa(ui_SelectionRect, 30, 0);
     lv_obj_set_style_bg_color(ui_SelectionRect, lv_color_white(), 0);
     lv_obj_set_style_border_width(ui_SelectionRect, 3, 0);
@@ -262,10 +288,10 @@ void ui_Screen1_screen_init(void)
     ui_SceneWordsText = NULL;  /* 暂不使用，保留符号供外部兼容 */
     ui_SceneWordsHint = build_page_footer(ui_SceneWordsContainer, kExitHint);
 
-    // ==================== 英语对练页面 ====================
+    // ==================== 拟境英语页面 ====================
     ui_EnglishTalkContainer = new_function_page(ui_Screen1);
     ui_EnglishTalkTitle = lv_label_create(ui_EnglishTalkContainer);
-    lv_label_set_text(ui_EnglishTalkTitle, "英语对练");
+    lv_label_set_text(ui_EnglishTalkTitle, "拟境英语");
     lv_obj_set_style_text_font(ui_EnglishTalkTitle, &ui_font_alibaba_48, 0);
     lv_obj_set_style_text_color(ui_EnglishTalkTitle, lv_color_white(), 0);
     lv_obj_align(ui_EnglishTalkTitle, LV_ALIGN_TOP_MID, 0, 20);
@@ -284,5 +310,14 @@ void ui_Screen1_screen_init(void)
     ui_PhotoSearchCounter = NULL;
     ui_PhotoSearchPath    = NULL;
     ui_PhotoSearchHint = build_page_footer(ui_PhotoSearchContainer, kExitHint);
+
+    // ==================== 英语对练页面（第四张卡）====================
+    ui_EnglishPracticeContainer = new_function_page(ui_Screen1);
+    ui_EnglishPracticeTitle = lv_label_create(ui_EnglishPracticeContainer);
+    lv_label_set_text(ui_EnglishPracticeTitle, "英语对练");
+    lv_obj_set_style_text_font(ui_EnglishPracticeTitle, &ui_font_alibaba_48, 0);
+    lv_obj_set_style_text_color(ui_EnglishPracticeTitle, lv_color_white(), 0);
+    lv_obj_align(ui_EnglishPracticeTitle, LV_ALIGN_TOP_MID, 0, 20);
+    ui_EnglishPracticeHint = build_page_footer(ui_EnglishPracticeContainer, kExitHint);
 }
 
