@@ -65,27 +65,32 @@ make clean && make
 
 ### 部署到眼镜
 
-首次部署，按顺序执行以下三步（之后只有改代码时才需要重复第 1 步）：
+**`make deploy` 一键推送所有内容**（幂等，可重复执行）：
 
 ```bash
-# 1) 推送主程序
+# 修改 scripts/myapp.conf.sample（填入你的 WiFi / 算法服务 IP）
+# 然后：
 make deploy
-
-# 2) 推送启停脚本（一次即可）
-make deploy-script
-
-# 3) 推送运行时配置 myapp.conf（WiFi / 算法服务 IP）
-#    部署前先按下面"配置文件"一节把 scripts/myapp.conf.sample 改成你自己的值
-make deploy-conf
 ```
 
-三个目标实际执行的命令：
+`deploy` 会把以下全部内容推到眼镜：
+- `build/bin/my-app`                → `/oem/usr/bin/my-app`
+- `scripts/myapp.conf.sample`       → `/oem/etc/myapp.conf`
+- `libonnxruntime.so.1.14.1`        → `/oem/usr/lib/`（并建 .so 软链）
+- `models/silero_vad.ort`           → `/oem/etc/silero_vad.ort`
 
-| Make 目标 | 实际命令 |
-|-----------|---------|
-| `deploy`        | `adb push build/bin/my-app /oem/usr/bin/my-app` + `chmod +x` |
-| `deploy-script` | `adb push scripts/app_switch.sh /oem/usr/bin/app_switch.sh` + `chmod +x` |
-| `deploy-conf`   | `adb push scripts/myapp.conf.sample /oem/etc/myapp.conf` |
+`deploy-script` 是独立的，只需做一次（推送启停脚本 `app_switch.sh`）：
+
+```bash
+make deploy-script   # 只在首次上机或脚本改动时执行
+```
+
+Make 目标说明：
+
+| Make 目标 | 作用 |
+|-----------|------|
+| `deploy`        | **一键**：二进制 + 配置 + libonnxruntime.so + silero_vad.ort |
+| `deploy-script` | 推送 `app_switch.sh`（只需做一次） |
 
 ---
 
@@ -106,11 +111,14 @@ wifi_ssid=CU_Ahta           # 你家/办公室路由器 SSID
 wifi_password=xd39ad5z      # WiFi 密码
 wifi_iface=wlan0            # 一般不用改
 
-# ---- 算法服务（VLM / 翻译 / 拍照搜题 共用一台服务器） ----
-server_host=192.168.1.7     # 算法服务所在机器的局域网 IP
-vlm_port=8002               # 多模态百科
-homework_port=8003          # 拍照搜题
-translate_port=8004         # 实时翻译
+# ---- 算法服务（四个功能共用一台服务器） ----
+# 端口 key 命名统一为 "<功能英文名>_port"；老 key（vlm_port/homework_port/
+# translate_port/english_port）仍兼容解析。
+server_host=192.168.1.7           # 算法服务所在机器的局域网 IP
+scene_words_port=8002             # 场景单词 (ws://host:8002/scene_words)
+photo_search_port=8003            # 拍照搜题 (ws://host:8003/photo_search)
+immersive_english_port=8004       # 拟境英语 (ws://host:8004/immersive_english)
+english_practice_port=8005        # 英语对练 (ws://host:8005/，全双工)
 ```
 
 ### 修改配置的两种方式
@@ -118,7 +126,7 @@ translate_port=8004         # 实时翻译
 **方式 A（推荐，可重现）**：改源码里的 `scripts/myapp.conf.sample`，然后：
 
 ```bash
-make deploy-conf
+make deploy   # 会一并重新推送 myapp.conf
 adb shell /oem/usr/bin/app_switch.sh stop
 adb shell /oem/usr/bin/app_switch.sh myapp -f
 ```
@@ -172,12 +180,13 @@ adb shell /oem/usr/bin/app_switch.sh log myapp
 ### 首次上机的完整 Checklist
 
 1. `cd OpenSource-Ai-Glasses/src/my-app`
-2. 编辑 `scripts/myapp.conf.sample`，填入你自己的 WiFi SSID / 密码、算法服务 IP
-3. `make clean && make`                  编译
-4. `make deploy`                          推送 my-app
-5. `make deploy-script`                   推送 app_switch.sh（只需做一次）
-6. `make deploy-conf`                     推送 myapp.conf（改了配置就重新执行）
-7. `adb shell /oem/usr/bin/app_switch.sh myapp -f`   启动并跟随日志
+2. 编辑 `scripts/myapp.conf.sample`，填入 WiFi SSID / 密码、算法服务 IP
+3. `make clean && make`          编译
+4. `make deploy`                 **一键推送**：my-app + myapp.conf + libonnxruntime.so + silero_vad.ort
+5. `make deploy-script`          推送 app_switch.sh（只需做一次）
+6. `adb shell /oem/usr/bin/app_switch.sh myapp -f`   启动并跟随日志
+
+> 之后每次改代码只需 `make deploy` 即可；改配置也只需 `make deploy` （会覆盖 myapp.conf）。
 
 ### 命令行参数
 
@@ -450,6 +459,97 @@ typedef enum {
 
 ---
 
+## 英语对练（HOME_ENGLISH）
+
+device 端把 Silero VAD 跑在眼镜上，摄像头 + 麦克风 + 扬声器 + 上云全部闭环，对标 `english_practice/device_main.py`。
+
+### 架构
+
+```
+ mic (ai_audio, 16 kHz PCM16)
+   │  每 32 ms 一帧 (512 样本)
+   ▼
+ core/vad.c  (Silero VAD via onnxruntime C API, FP32 + NEON)
+   │  SPEECH_START  → 触发摄像头异步抓帧（take_photo）
+   │  SPEECH_CHUNK  → 0x04 PCM 二进制帧 → WS 上行
+   │  SPEECH_END    → audio_end JSON
+   ▼
+ app/app_english.c  (core/net/ws_client.c, mongoose)
+   ▲        │
+   │        └── 0x03 JPEG（摄像头帧）+ JSON 控制
+   │
+ cloud english_practice (:english_practice_port, 默认 8005)
+   │
+   ▼
+ 0x01 TTS PCM 24 kHz → core/tts_player.c → 喇叭
+```
+
+### 在设备上的占用（实测）
+
+- `libonnxruntime.so.1.14.1`：2.4 MB（stripped, minimal build, NEON FP32）
+- `silero_vad.ort`：约 1.7 MB（.ort v5, 已包含 FusedConv）
+- 运行时：session load 122 ms, 每帧推理 ≈ 9.7 ms / 32 ms 音频，peak RSS 3.8 MB
+- 实测设备可用内存 78 MB → 余量充足
+
+### 关键文件
+
+| 文件 | 作用 |
+|------|------|
+| `core/vad.h/.c` | 封装 ORT C API 为 `SPEECH_START/CHUNK/SPEECH_END` 状态机 |
+| `app/app_english.h/.c` | WS 全双工 + mic pump + VAD 驱动 + TTS 24k + 摄像头异步抓帧 |
+| `third_party/onnxruntime/` | 交叉编译好的 libonnxruntime.so + 头文件 + 构建说明 |
+| `models/silero_vad.ort` | 转换后的 Silero VAD 模型（minimal ORT 格式） |
+| `models/silero_vad.onnx` | 原始模型（仅做备份/重新转换用） |
+
+### 部署到眼镜
+
+```bash
+make deploy   # 一键推送：my-app + myapp.conf + libonnxruntime.so + silero_vad.ort
+```
+
+### 与 device_main.py 的逻辑对照
+
+| 特性 | Python（device/vad.py + device_main.py） | C（core/vad.c + app/app_english.c） |
+|------|------------------------------------------|--------------------------------------|
+| Silero V5 输入形状 | `[1, 576]`（64 context + 512 window） | `[1, 576]` ✓ |
+| 激活阈值 | 0.50 | 0.50 ✓ |
+| 失活阈值（迟滞） | 0.35 | 0.35 ✓ |
+| ExpFilter alpha | 0.35 | 0.35 ✓ |
+| prefix-padding | 0.5 s（16 帧）随 SPEECH_START 一次性推送 | 0.5 s（16 帧）✓ |
+| min_speech | 50 ms | 250 ms（嵌入式环境偏保守，少误触发） |
+| min_silence | 400 ms | 600 ms（允许句中换气） |
+| 二进制协议 | 0x01 TTS / 0x03 JPEG / 0x04 PCM | 同 ✓ |
+| audio_start JSON | `{"type":"audio_start","has_frame":bool}` | 同 ✓ |
+| audio_end / interrupt | `{"type":"audio_end/interrupt"}` | 同 ✓ |
+| 摄像头策略 | 每轮 SPEECH_START 时实时抓帧（异步） | 预热抓帧存 g_frame_jpg，SPEECH_START 取用；同时为下一轮 kick 新快照 |
+| Barge-in | SPEECH_START while agent speaking → interrupt + stop TTS | 同 ✓ |
+| TTS 采样率 | 24 kHz 16-bit | 24 kHz 16-bit ✓ |
+| 麦克风采样率 | 16 kHz 16-bit mono | 16 kHz 16-bit mono ✓ |
+
+### 使用方式
+
+1. `myapp.conf` 填 `server_host` + `english_practice_port=8005`
+2. 首页翻页到"英语对练"，确认键进入
+3. 自动连接 WS，进入 MODE_ACTIVE：
+   - 用户开口 → VAD 检测到 SPEECH_START，摄像头抓一帧 JPEG 一起上传
+   - 持续说话 → 16 kHz PCM 以 0x04 帧边说边送
+   - 说完 → `audio_end` → 云端识别 → 下发 24 kHz TTS PCM（0x01）→ 喇叭播放
+4. 对练期间再按确认键 → 发送 `interrupt`，暂停 mic / VAD / 播放
+5. 退出键返回首页 → `app_english_exit` 收尾
+
+### 调优旋钮（`core/vad.h` + `app_english.c` 内 `ensure_vad`）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `speech_threshold` | 0.5 | 激活阈值（越高越严，0.3~0.7） |
+| `min_speech_ms` | 250 | 连续 N ms 高于阈值才判开口 |
+| `min_silence_ms` | 600 | 连续 N ms 低于失活阈值才判闭口 |
+| `TH_DEACT`（vad.c 内） | 0.35 | 失活阈值（迟滞，低于此才开始计静音帧） |
+| `SMOOTH_ALPHA`（vad.c 内） | 0.35 | ExpFilter 系数 |
+| `PREFIX_FRAMES`（vad.c 内） | 16 | prefix-padding 缓冲帧数（16×32ms=0.5s） |
+
+---
+
 ## 功能实现状态
 
 | 功能 | 状态 | 说明 |
@@ -467,6 +567,7 @@ typedef enum {
 | 麦克风采集 | **未实现** | 需接入 `ai_audio` SDK |
 | 喇叭播放 | **未实现** | 需接入 `ai_audio` SDK |
 | 长按检测 | **未实现** | 当前仅处理 PRESS 事件，可加 RELEASE 实现 |
+| 英语对练（HOME_ENGLISH） | **已实现** | Silero VAD on-device（ORT 交叉编译）+ WS 全双工 + 摄像头抓帧 + 24k TTS 播放 |
 
 ---
 
@@ -479,7 +580,9 @@ my-app
   │     └── ai_gpio     → 通过共享内存+Socket 连接 ai-core GPIO Hub
   ├── libpthread (动态链接) → 多线程支持
   ├── librt (动态链接) → POSIX 共享内存
-  └── libm (动态链接) → 数学库
+  ├── libm (动态链接) → 数学库
+  ├── libjpeg (动态链接) → NV12 → JPEG 软编码
+  └── libonnxruntime.so.1.14.1 (动态链接, /oem/usr/lib) → 英语对练 Silero VAD
 
 系统服务依赖：
   display-service  → 必须运行，否则无法显示

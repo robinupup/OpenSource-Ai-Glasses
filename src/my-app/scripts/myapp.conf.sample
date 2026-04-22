@@ -12,14 +12,18 @@
 # ============================================================
 
 # -------- 1) WiFi（开机后自动连接） --------
+#CU_Ahta  xd39ad5z
 wifi_ssid=CU_Ahta
 wifi_password=xd39ad5z
 # 无线网卡名，一般不用改
 wifi_iface=wlan0
 
-# -------- 2) 算法服务地址（VLM / 翻译 / 拍照搜题 共用同一台服务器） --------
-# 把这里改成你自己的算法服务 IP，三个子服务端口按实际部署填写
+# -------- 2) 算法服务地址（四个功能共用同一台服务器） --------
+# 把这里改成你自己的算法服务 IP，子服务端口按实际部署填写。
+# 端口 key 统一用"功能英文名_port"；老 key（vlm_port/homework_port/
+# translate_port/english_port）仍被 config.c 解析，升级无痛。
 server_host=192.168.1.7
-vlm_port=8002
-homework_port=8003
-translate_port=8004
+scene_words_port=8002          # 场景单词 (ws://host:8002/scene_words)
+photo_search_port=8003         # 拍照搜题 (ws://host:8003/photo_search)
+immersive_english_port=8004    # 拟境英语 (ws://host:8004/immersive_english)
+english_practice_port=8005     # 英语对练 (ws://host:8005/，全双工 WS)

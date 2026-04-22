@@ -138,45 +138,69 @@ static void handle_json(const char *text, size_t len) {
 
     } else if (strcmp(type, "content") == 0) {
         /*
-         * 服务端 x_engine/photo_search/serve.py 的两种 content 形态：
-         *   Solve 结束：  data 为字符串 —— 完整 JSON 树 "{\"nodes\":[...]}"
-         *   Expand 结束： data 为对象   —— {"children":[...]}   (见 serve.py 第 479 行)
-         * 字符串直接喂 loader；对象先 cJSON_PrintUnformatted 再走同一通道。
+         * 服务端 x_engine/photo_search/serve.py 的三种 content 形态：
+         *   1) Solve 结束（正常）：data 为字符串 —— 完整 JSON 树 "{\"nodes\":[...]}"
+         *   2) Solve 结束（回落）：data 为字符串 —— 纯答案文本（core.py 第 388~392 行，
+         *       build_tree 失败 / tree.nodes 为空但 answer_text 非空时的兜底；
+         *       以及 core.py 异常分支 yield ("content", f"处理失败: {e}") ）
+         *   3) Expand 结束：      data 为对象   —— {"children":[...]}（serve.py 第 479 行）
+         * 字符串先尝试按 JSON 树加载；不是树时作为纯文本直接展示到 content_label。
          */
         const cJSON *jd = cJSON_GetObjectItemCaseSensitive(root, "data");
         char *serialized = NULL;
         const char *json_for_load = NULL;
+        int is_plain_text = 0;
         if (cJSON_IsString(jd) && jd->valuestring) {
             json_for_load = jd->valuestring;
+            /* 快速判断是否为 JSON 对象：首个非空白字符是 '{' 才按树加载 */
+            const char *p = json_for_load;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p != '{') is_plain_text = 1;
         } else if (cJSON_IsObject(jd) || cJSON_IsArray(jd)) {
             serialized    = cJSON_PrintUnformatted(jd);
             json_for_load = serialized;
         }
-        if (json_for_load) {
-            /* 结果返回：隐藏 ASR，只留知识树 */
+
+        if (is_plain_text) {
+            /* 纯答案文本：隐藏 ASR，清空知识树，直接把文本写到 content_label。*/
+            app_ui_hide_asr();
+            pthread_mutex_lock(&g_lock);
+            reset_tree();
+            pthread_mutex_unlock(&g_lock);
+            app_ui_set_text(app_common_get_ui()->content_label, json_for_load);
+            app_ui_set_tree_cursor(-1);
+        } else if (json_for_load) {
             app_ui_hide_asr();
             pthread_mutex_lock(&g_lock);
             hw_node_t *parent = NULL;
             if (g_expand_target) {
                 parent = (hw_node_t *)g_expand_target;
-                /* 清掉占位的"查询中..."节点（也清掉旧的展开结果，防重复） */
                 hw_tree_clear_children(parent);
             } else {
                 parent = g_tree;
             }
             int before = parent ? parent->child_count : 0;
             int added  = hw_tree_load_json_into(parent, json_for_load);
-            /* 若首次构建，把光标落在第一个顶层节点上 */
             if (!g_cursor && g_tree && g_tree->child_count > 0) {
                 g_cursor = g_tree->children[0];
             }
-            /* expand 成功后，光标跳到新挂的第一个子节点，方便用户继续深入 */
             if (g_expand_target && added > 0 && parent->child_count > before) {
                 g_cursor = parent->children[before];
                 g_expand_target = NULL;
             }
+            /* 解析失败（added < 0）且非 expand 场景：字符串是 JSON 但不含
+             * nodes/children 键。作为保险分支，退化为纯文本展示。*/
+            int parse_failed_for_solve = (added < 0 && !g_expand_target);
             pthread_mutex_unlock(&g_lock);
-            refresh_tree_display();
+            if (parse_failed_for_solve) {
+                pthread_mutex_lock(&g_lock);
+                reset_tree();
+                pthread_mutex_unlock(&g_lock);
+                app_ui_set_text(app_common_get_ui()->content_label, json_for_load);
+                app_ui_set_tree_cursor(-1);
+            } else {
+                refresh_tree_display();
+            }
         }
         if (serialized) free(serialized);
 
@@ -231,7 +255,7 @@ static int ensure_ws_open(void) {
     if (g_ws && ws_client_is_open(g_ws)) return 1;
     if (g_ws) { ws_client_close(g_ws); g_ws = NULL; }
     char url[256];
-    myapp_config_build_url(url, sizeof(url), g_host, g_port, "/homework_finding");
+    myapp_config_build_url(url, sizeof(url), g_host, g_port, "/photo_search");
     printf("[homework] (re)open %s\n", url);
     g_ws = ws_client_open(url);
     if (!g_ws) { set_status("✕ WS 打开失败"); return 0; }
@@ -262,9 +286,22 @@ static void start_round(void) {
     char jpeg_path[256] = {0};
     if (myapp_take_photo(jpeg_path, sizeof(jpeg_path)) != 0) {
         set_status("✕ 拍照失败");
+        /* 失败必须把状态回退到 IDLE，否则下一次按电源键会被误判为"停麦"，
+         * 发出空 mic=off 并卡在 ST_WAIT（服务端因无 ASR 而 continue，
+         * 永远不会回 done）。下同。 */
+        pthread_mutex_lock(&g_lock);
+        g_state = ST_IDLE;
+        pthread_mutex_unlock(&g_lock);
         return;
     }
-    if (!ensure_ws_open()) { set_status("✕ WS 未就绪"); return; }
+    if (!ensure_ws_open()) {
+        set_status("✕ WS 未就绪");
+        if (jpeg_path[0]) unlink(jpeg_path);
+        pthread_mutex_lock(&g_lock);
+        g_state = ST_IDLE;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
 
     if (g_mic) stop_mic(); /* 防御：上一轮 mic 未关时先关干净 */
 
@@ -286,10 +323,18 @@ static void start_round(void) {
         }
         free(b64);
     }
+    /* base64 已经送走，tmpfs 上的 JPEG 也不再需要，立即删除，避免眼镜本地留存。 */
+    if (jpeg_path[0]) unlink(jpeg_path);
 
     mic_params_t p = { .sample_rate = 16000, .channels = 1, .bit_width = 16 };
     g_mic = mic_pump_start(&p, 1280, on_pcm, NULL);
-    if (!g_mic) { set_status("✕ 麦克风启动失败"); return; }
+    if (!g_mic) {
+        set_status("✕ 麦克风启动失败");
+        pthread_mutex_lock(&g_lock);
+        g_state = ST_IDLE;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     app_common_set_mic_on(1);
     set_status("● 录音中(电源键=关)");
 }

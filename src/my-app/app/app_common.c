@@ -166,6 +166,9 @@ void app_ui_clear_crop(void) {
     const app_ui_t *ui = app_common_get_ui();
     if (!ui->crop_img) return;
     app_ui_lock();
+    /* LVGL 的 lv_img 在 src=NULL 时会画一个绿色 "No data" 占位符。
+     * 直接把控件隐藏掉，空白就是空白，不给占位符任何出场机会。*/
+    lv_obj_add_flag(ui->crop_img, LV_OBJ_FLAG_HIDDEN);
     lv_img_set_src(ui->crop_img, NULL);
     lv_img_cache_invalidate_src(&g_crop_dsc);
     if (g_crop_buf) { free(g_crop_buf); g_crop_buf = NULL; }
@@ -187,7 +190,10 @@ void app_ui_show_crop_b64_jpeg(const char *b64) {
     if (!jpg || jpg_len < 16) { free(jpg); return; }
 
     uint8_t *pix = NULL; int w = 0, h = 0;
-    int rc = jpeg_decode_to_lvgl8(jpg, jpg_len, 200, &pix, &w, &h);
+    /* target_max 给一个远大于屏幕的值，让 JPEG 解码器不做 1/2、1/4 下采样，
+     * 直接按服务端返回的原始分辨率解码。显示时 crop_img 会 set_size(w, h)，
+     * 所以最终控件尺寸就是服务端返回的图像尺寸。*/
+    int rc = jpeg_decode_to_lvgl8(jpg, jpg_len, 99999, &pix, &w, &h);
     free(jpg);
     if (rc != 0 || !pix) return;
 
@@ -203,6 +209,8 @@ void app_ui_show_crop_b64_jpeg(const char *b64) {
     lv_img_cache_invalidate_src(&g_crop_dsc);
     lv_img_set_src(ui->crop_img, &g_crop_dsc);
     lv_obj_set_size(ui->crop_img, w, h);
+    /* 收到真正的 JPEG，才让控件可见；与 app_ui_clear_crop 的 HIDDEN 配对。*/
+    lv_obj_clear_flag(ui->crop_img, LV_OBJ_FLAG_HIDDEN);
     /* 图片紧贴 content 文字下方居中显示（间隙=0 真正贴齐） */
     if (ui->content_label) {
         lv_obj_align_to(ui->crop_img, ui->content_label,

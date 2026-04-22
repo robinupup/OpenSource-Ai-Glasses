@@ -27,6 +27,13 @@
 
 #define ARECORD_BIN      "/usr/bin/arecord"
 #define ALSA_PCM_CAPTURE "/dev/snd/pcmC0D0c"
+#define ALSA_CTL_DEVICE  "/dev/snd/controlC0"
+
+/* 开流后需要丢弃的预热帧数 —— 驱动/acodec 刚 START 时，前 ~100ms
+ * 会有 DC 瞬态 / DMA 首包 glitch（实测 peak 会到 -32768），
+ * 直接送到 ASR/VLM 会被当成爆音，且拉低 RMS 平均。用 100ms 的采样
+ * 数作为丢弃阈值，足够越过瞬态，又不会影响用户体感起录延迟。 */
+#define WARMUP_DISCARD_MS  100
 
 struct mic_stream {
     /* arecord 后端 */
@@ -36,6 +43,10 @@ struct mic_stream {
     /* 原生 ALSA 后端 */
     int   alsa_fd;
     int   frame_bytes;
+    int   sample_rate;
+
+    /* 预热：还需要丢弃的字节数（开流后前 WARMUP_DISCARD_MS 毫秒）*/
+    size_t warmup_bytes_remaining;
 
     /* 外部请求尽快返回（用于打断 pump 线程内的阻塞 ioctl/read） */
     volatile int stopping;
@@ -72,6 +83,66 @@ static void interval_set(struct snd_interval *v, unsigned int val) {
     memset(v, 0, sizeof(*v));
     v->min = v->max = val;
     v->integer = 1;
+}
+
+/* ---- 麦克风增益 / AGC 配置 ---------------------------------------------
+ * 设备固件里没有 amixer / tinymix，无法从 shell 脚本里调；且 ALSA 控件
+ * 每次 codec 断电再通电都会回到驱动默认值：
+ *   ADC MIC Left Gain       = 2/3       （模拟 PGA，不是最大档）
+ *   ADC ALC Left Volume     = 6/31      （数字 ALC 偏低）
+ *   ALC AGC Left Switch     = Off       （AGC 关，导致说话距离稍远就小）
+ *   AGC Approximate SR      = 96 kHz    （我们实采 16 kHz，AGC 时间常数错的）
+ * 实测开机默认这套值时，mic_test 测得底噪 RMS 也只有 -50 dBFS 左右，
+ * 说话时 ASR 端经常抱怨"听不清"。
+ *
+ * 这里每次 mic_capture_start() 都通过 /dev/snd/controlC0 的 ioctl 把下面
+ * 几个控件强制刷一次，把 AGC 打开、采样率对齐到 16 kHz、ALC 给到 20/31，
+ * 保证断电重启后行为一致，不依赖外部脚本。
+ *
+ * 任何一项 set 失败都只打 warning，不影响采集本身。
+ */
+static int ctl_set_integer_by_name(int fd, const char *name, long value) {
+    struct snd_ctl_elem_info info;
+    memset(&info, 0, sizeof(info));
+    info.id.iface = SNDRV_CTL_ELEM_IFACE_MIXER;
+    snprintf((char *)info.id.name, sizeof(info.id.name), "%s", name);
+    if (ioctl(fd, SNDRV_CTL_IOCTL_ELEM_INFO, &info) < 0) return -1;
+
+    struct snd_ctl_elem_value val;
+    memset(&val, 0, sizeof(val));
+    val.id = info.id;
+    if (info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED) {
+        val.value.enumerated.item[0] = (unsigned int)value;
+    } else {
+        val.value.integer.value[0] = value;
+    }
+    return ioctl(fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &val);
+}
+
+static void apply_capture_gains(void) {
+    int fd = open(ALSA_CTL_DEVICE, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[mic] open %s: %s (skip mic gain tuning)\n",
+                ALSA_CTL_DEVICE, strerror(errno));
+        return;
+    }
+    struct { const char *name; long value; } tuning[] = {
+        /* 模拟 PGA 最大档 —— 不爆麦，MEMS 麦克风在眼镜上离嘴远，需要拉满 */
+        { "ADC MIC Left Gain",                3 },
+        /* 数字 ALC 音量 —— 20/31 给 AGC 留一点余量，既不削波又不至于小 */
+        { "ADC ALC Left Volume",             20 },
+        /* AGC 估计采样率，和实采 16 kHz 对齐（枚举：5 = 16KHz） */
+        { "AGC Left Approximate Sample Rate", 5 },
+        /* 打开 AGC，自动压峰提平均，对远场说话提升最明显 */
+        { "ALC AGC Left Switch",              1 },
+    };
+    for (size_t i = 0; i < sizeof(tuning)/sizeof(tuning[0]); i++) {
+        if (ctl_set_integer_by_name(fd, tuning[i].name, tuning[i].value) < 0) {
+            fprintf(stderr, "[mic] mixer set '%s'=%ld: %s\n",
+                    tuning[i].name, tuning[i].value, strerror(errno));
+        }
+    }
+    close(fd);
 }
 
 static int alsa_snd_format(int bit_width) {
@@ -194,9 +265,14 @@ mic_stream_t *mic_capture_start(const mic_params_t *params) {
     if (params) p = *params;
     fill_defaults(&p);
 
+    /* 无论走哪条后端，先统一把 codec 增益/AGC 拨到位。
+     * 失败不致命（只是声音会偏小），打 warning 就继续。 */
+    apply_capture_gains();
+
     mic_stream_t *s = (mic_stream_t *)calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->pid = -1; s->pipe_fd = -1; s->alsa_fd = -1;
+    s->sample_rate = p.sample_rate;
 
     if (have_arecord()) {
         int pipefd[2];
@@ -225,6 +301,14 @@ mic_stream_t *mic_capture_start(const mic_params_t *params) {
     if (fd < 0) { free(s); return NULL; }
     s->alsa_fd     = fd;
     s->frame_bytes = (p.bit_width / 8) * p.channels;
+
+    /* 预热：前 WARMUP_DISCARD_MS 毫秒的 PCM 数据是驱动 DMA 首包 glitch，
+     * 包含 DC 瞬态和 INT16 饱和点，直接送云端会触发 VAD 误判 / ASR 抖动，
+     * 统一在 mic_capture_read 入口处丢弃。arecord 子进程路径无法这样做
+     * （它自己内部 buffer），只覆盖原生 ALSA 路径。 */
+    s->warmup_bytes_remaining =
+        (size_t)p.sample_rate * (p.bit_width / 8) * p.channels
+        * WARMUP_DISCARD_MS / 1000;
     return s;
 }
 
@@ -239,7 +323,28 @@ ssize_t mic_capture_read(mic_stream_t *stream, void *buf, size_t size) {
     }
 
     if (stream->alsa_fd >= 0) {
-        /* 循环读至少一帧；但检测 stopping 时立即返回 -1，让 pump 线程退出。*/
+        /* 循环读至少一帧；但检测 stopping 时立即返回 -1，让 pump 线程退出。
+         * 另外：开流后前 WARMUP_DISCARD_MS ms 的 PCM 是 DMA 首包 glitch，
+         * 在返回给调用方前先在本地静默读掉，直到 warmup_bytes_remaining
+         * 归零为止。 */
+        while (stream->warmup_bytes_remaining > 0) {
+            if (stream->stopping) return -1;
+            /* 使用一块本地 buffer 读掉预热数据，大小按 chunk 读到不超过
+             * 剩余字节数；这里 4096 字节对应 16k/16bit mono ≈ 128ms，
+             * 一次就能把 100ms 预热吞掉。 */
+            uint8_t tmp[4096];
+            size_t want = stream->warmup_bytes_remaining;
+            if (want > sizeof(tmp)) want = sizeof(tmp);
+            ssize_t n = alsa_read_once(stream->alsa_fd, tmp, want,
+                                       stream->frame_bytes);
+            if (n < 0) return n;   /* 致命错误直接返回 */
+            if (n == 0) continue;  /* EAGAIN / overrun 重试 */
+            if ((size_t)n >= stream->warmup_bytes_remaining) {
+                stream->warmup_bytes_remaining = 0;
+            } else {
+                stream->warmup_bytes_remaining -= (size_t)n;
+            }
+        }
         for (;;) {
             if (stream->stopping) return -1;
             ssize_t n = alsa_read_once(stream->alsa_fd, buf, size, stream->frame_bytes);

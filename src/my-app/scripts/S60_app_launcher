@@ -1,0 +1,29 @@
+#!/bin/sh
+# S60_app_launcher
+#
+# 开机脚本：检查 /oem/etc/myapp_autostart 标志，存在就后台拉起 my-app；
+# 不存在就什么都不做（不拉 my-app，也不拉 launcher-app）。
+#
+# 打开/关闭自启的正确姿势：
+#   /oem/usr/bin/app_switch.sh autostart on
+#   /oem/usr/bin/app_switch.sh autostart off
+#
+# 别直接 rm/touch 这个标志文件，走 app_switch 封装能保证 sync。
+
+AUTOSTART_FLAG=/oem/etc/myapp_autostart
+APP_SWITCH=/oem/usr/bin/app_switch.sh
+BOOT_LOG=/tmp/myapp_autostart.log
+
+case "$1" in
+    start|"")
+        if [ -f "$AUTOSTART_FLAG" ] && [ -x "$APP_SWITCH" ]; then
+            # 后台拉起，脱离 init 的 stdio；app_switch.sh myapp 本身
+            # 内部还会 nohup 一次真正的 my-app，这里只是触发。
+            nohup "$APP_SWITCH" myapp </dev/null >"$BOOT_LOG" 2>&1 &
+        fi
+        ;;
+    stop|restart)
+        killall my-app launcher-app display-service ai-core guard 2>/dev/null
+        ;;
+esac
+exit 0

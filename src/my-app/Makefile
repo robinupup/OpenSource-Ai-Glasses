@@ -29,6 +29,7 @@ CORE_SRC   := \
     core/wifi.c           \
     core/config.c         \
     core/power_key.c      \
+    core/vad.c            \
     core/net/ws_client.c  \
     core/net/base64.c     \
     core/display/waveguide.c \
@@ -40,6 +41,7 @@ APP_SRC    := \
     app/app_vlm.c         \
     app/app_translate.c   \
     app/app_homework.c    \
+    app/app_english.c     \
     app/hw_tree.c
 
 THIRD_SRC  := \
@@ -61,6 +63,12 @@ LIBJPEG_ROOT ?= $(DEV_ENV_ROOT)/output/out/app_out
 CFLAGS  += -I$(LIBJPEG_ROOT)/include/libjpeg9
 LDFLAGS := -L$(LIBJPEG_ROOT)/lib -ljpeg -lpthread -lrt -lm
 
+# onnxruntime（Silero VAD for 英语对练，armv7-a + NEON + uClibc cross-build）
+# libonnxruntime.so 运行时必须位于 /oem/usr/lib，`make deploy` 会一并推送。
+ONNXRT_ROOT := third_party/onnxruntime
+CFLAGS  += -I$(ONNXRT_ROOT)/include
+LDFLAGS += -L$(ONNXRT_ROOT)/lib -lonnxruntime -Wl,-rpath,/oem/usr/lib
+
 # LVGL UI (main.c 依赖；如需裸运行可 `make ENABLE_LVGL=0`，但将无法显示 UI)
 ENABLE_LVGL ?= 1
 ifeq ($(ENABLE_LVGL),1)
@@ -76,7 +84,7 @@ ifeq ($(ENABLE_LVGL),1)
     ALL_OBJS += $(LVGL_OBJ)
 endif
 
-.PHONY: all clean deploy deploy-conf deploy-script debug_vars
+.PHONY: all clean deploy deploy-script debug_vars
 all: $(TARGET_BIN)
 
 debug_vars:
@@ -102,17 +110,25 @@ $(OBJ_DIR)/lvgl/%.o: %.c
 clean:
 	rm -rf $(BUILD_DIR)
 
+# 一键部署：my-app 二进制 + 运行时配置 + onnxruntime 动态库 + Silero 模型。
+# 全量推送，幂等，重复执行也没副作用（只会覆盖已有文件）。
 deploy: $(TARGET_BIN)
+	adb shell mkdir -p /oem/etc /oem/usr/bin /oem/usr/lib
+	@echo "--- push my-app binary ---"
 	adb push $(TARGET_BIN) /oem/usr/bin/$(TARGET)
 	adb shell chmod +x /oem/usr/bin/$(TARGET)
-	@echo "Deployed to /oem/usr/bin/$(TARGET)"
-
-# 把运行时配置 (WiFi / 算法服务) 推到眼镜
-# 首次部署时必须执行一次；之后只有改配置时再执行
-deploy-conf:
-	adb shell mkdir -p /oem/etc
+	@echo "--- push runtime config ---"
 	adb push scripts/myapp.conf.sample /oem/etc/myapp.conf
-	@echo "Deployed config to /oem/etc/myapp.conf"
+	@echo "--- push onnxruntime + Silero VAD (英语对练) ---"
+	adb push $(ONNXRT_ROOT)/lib/libonnxruntime.so.1.14.1 /oem/usr/lib/
+	adb shell "cd /oem/usr/lib && ln -sf libonnxruntime.so.1.14.1 libonnxruntime.so"
+	adb push models/silero_vad.ort /oem/etc/silero_vad.ort
+	@echo ""
+	@echo "Deployed:"
+	@echo "  /oem/usr/bin/$(TARGET)"
+	@echo "  /oem/etc/myapp.conf"
+	@echo "  /oem/usr/lib/libonnxruntime.so[.1.14.1]"
+	@echo "  /oem/etc/silero_vad.ort"
 
 # 把启停脚本 app_switch.sh 推到眼镜（一次就够，除非脚本改了）
 deploy-script:

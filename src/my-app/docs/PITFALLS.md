@@ -30,7 +30,7 @@
 - 修法：
   1. 所有 `mic_pump_start()` 之前加兜底 `if (g_mic) stop_mic();`。
   2. Server 推送的 `done / interrupted` **只在 `ST_WAIT` 时才回 `ST_IDLE`**，
-     `ST_REC` 期间坚决不动状态和 mic（尤其 `realtime_translate` 是连续识别，每句都会 done）。
+     `ST_REC` 期间坚决不动状态和 mic（尤其 `immersive_english` 是连续识别，每句都会 done）。
 
 ### 1.3 aplay 缺失 / 播放失败
 - 规避：所有播放走 `core/speaker` 内置 ALSA 写入，不要 `system("aplay ...")`。

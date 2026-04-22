@@ -10,9 +10,11 @@
  * 拍照实现：完全对照 src/ffm_launcher/launch.cpp：
  *   - /dev/v4l-subdev2 设置 曝光=1300, 模拟增益=200
  *   - /dev/video7      1920x1080 NV12 (V4L2 MPLANE) 单帧采集
- *   - NV12 原始数据  -> /tmp/myapp_frame_nv12.raw
- *   - libjpeg 软编码 -> /userdata/myapp/photos/photo_YYYYmmdd_HHMMSS.jpg
+ *   - NV12 原始数据  -> /tmp/myapp_frame_nv12.raw        (tmpfs，用完即删)
+ *   - libjpeg 软编码 -> /tmp/myapp_frame.jpg             (tmpfs，调用方发送完后 unlink)
  *     （设备上没有 ffmpeg/cjpeg，只有 libjpeg.so.9，因此在进程内直接调用）
+ *     注意：为了不把照片写进眼镜本地 flash，JPEG 只写在 /tmp（tmpfs，断电即失），
+ *     且使用固定文件名滚动覆盖，不再按时间戳累积。
  */
 
 #include <stdio.h>
@@ -45,6 +47,7 @@
 #include "app/app_vlm.h"
 #include "app/app_translate.h"
 #include "app/app_homework.h"
+#include "app/app_english.h"
 
 /* ==================== 配置 ====================
  * WiFi SSID/密码 与 算法服务 IP/端口 等运行时配置，
@@ -86,20 +89,26 @@
 #define CAM_WIDTH          1920
 #define CAM_HEIGHT         1080
 /* 曝光/增益默认值。可用环境变量 MYAPP_EXPOSURE / MYAPP_GAIN 现场覆盖调试：
- *   MYAPP_EXPOSURE=3000 MYAPP_GAIN=800 /oem/usr/bin/my-app
- * 1300/200 是 launch.cpp 的值，但室内光下明显偏暗 → 默认改到 3000/600。
+ *   MYAPP_EXPOSURE=1700 MYAPP_GAIN=800 /oem/usr/bin/my-app
+ * 实测 IMX219 @ 1920x1080 mode 下 V4L2 驱动允许的 exposure 范围是 1~1759
+ * （见 v4l2-ctl -d /dev/v4l-subdev2 --list-ctrls），超过会被静默 clamp。
+ * analogue_gain 范围 0~3677，当前 600 室内偏暗；室外降到 200~300 更合适。
  */
-#define CAM_EXPOSURE_DEFAULT  3000
+#define CAM_EXPOSURE_DEFAULT  1700      /* 上限 1759，留点头空间 */
 #define CAM_GAIN_DEFAULT      600
 
-/* 拍照输出路径 */
-#define PHOTO_DIR          "/userdata/myapp/photos"
+/* 拍照输出路径 —— 一律放在 tmpfs，不落盘到眼镜本地存储
+ *   固定文件名：每次拍照直接覆盖上一次，不累积历史。
+ *   调用方（app_vlm / app_homework / app_english）在读取发送后会 unlink 删除。
+ */
+#define PHOTO_DIR          "/tmp"
 #define PHOTO_NV12_TMP     "/tmp/myapp_frame_nv12.raw"
+#define PHOTO_JPEG_PATH    "/tmp/myapp_frame.jpg"
 
 /* 首页四个选项 */
 typedef enum {
     HOME_SCENE   = 0,   /* 场景单词 */
-    HOME_TALK    = 1,   /* 拟境英语（原英语对练，后端仍为 realtime_translate）*/
+    HOME_TALK    = 1,   /* 拟境英语（immersive_english）*/
     HOME_SEARCH  = 2,   /* 拍照搜题 */
     HOME_ENGLISH = 3,   /* 英语对练（新增，后端待接入）*/
     HOME_COUNT
@@ -214,7 +223,8 @@ static void show_function_page(lv_obj_t *page) {
 
 /* ==================== 相机：V4L2 采集 + ffmpeg 转 JPEG ==================== */
 
-/* mkdir -p 实现（不依赖 system） */
+/* mkdir -p 实现（不依赖 system），目前拍照已改用 tmpfs 固定路径，暂时保留以备将来使用。 */
+__attribute__((unused))
 static int mkdir_p(const char *path) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -429,20 +439,54 @@ static int nv12_to_jpeg(const char *nv12_path, const char *jpeg_path,
     jpeg_set_quality(&cinfo, quality, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
 
+    /*
+     * 灰度世界（Gray-World）软件白平衡
+     * ------------------------------------------------------------------
+     * 背景：RV1103B 的 rkcif 绕过 ISP，Bayer→YUV 没有 AWB，IMX219 sensor 直出
+     *       的 Cb/Cr 均值固定偏离 128（实测 ~114 / ~114，明显偏绿）。
+     * 做法：先扫一遍 UV 算均值，整体平移使 avg_Cb = avg_Cr = 128，然后在原本
+     *       的 scanline 转换循环里 free-ride 减掉这个偏移。
+     * 开销：pass-1 均值 ≈ 8 ms（见 tools/wb_bench），pass-2 内联 0 额外成本。
+     * ------------------------------------------------------------------
+     * 字节序：实测 RV1103B / rkcif 在此路径下实际输出 NV21（V 在前 U 在后），
+     *         即 uvrow[2k]=Cr(V), uvrow[2k+1]=Cb(U)。
+     *         下面 awb_dv / awb_du 就分别对应这两条通道。 */
+    int awb_dv = 0, awb_du = 0;
+    {
+        uint64_t sV = 0, sU = 0;
+        size_t pairs = uvsize / 2;
+        for (size_t i = 0; i < pairs; i++) {
+            sV += uv[2 * i + 0];  /* byte0: Cr(V) */
+            sU += uv[2 * i + 1];  /* byte1: Cb(U) */
+        }
+        int avg_v = (int)(sV / pairs);
+        int avg_u = (int)(sU / pairs);
+        awb_dv = avg_v - 128;
+        awb_du = avg_u - 128;
+        /* 安全限幅：一次修正不超过 ±32，避免极端场景（比如整张纯色墙）被
+         * 灰度世界错误地强行中和成灰。日常偏色一般就 10~20 之内。 */
+        if (awb_dv >  32) awb_dv =  32;
+        if (awb_dv < -32) awb_dv = -32;
+        if (awb_du >  32) awb_du =  32;
+        if (awb_du < -32) awb_du = -32;
+        printf("[cam] AWB gray-world: avg_Cb=%d avg_Cr=%d → du=%+d dv=%+d\n",
+               avg_u, avg_v, -awb_du, -awb_dv);
+    }
+
     while (cinfo.next_scanline < (JDIMENSION)h) {
         int line = cinfo.next_scanline;
         const uint8_t *yrow  = y  + line * w;
         const uint8_t *uvrow = uv + (line / 2) * w;  /* 交错 UV，每 2 字节一组 */
         uint8_t *dst = row;
-        /*
-         * 实测 RV1103B / rkcif 在此路径下实际输出 NV21（V 在前 U 在后），
-         * 因此这里的字节顺序是 Cr 先、Cb 后。若以后换成真正的 NV12，把两行互换即可。
-         */
         for (int x = 0; x < w; x++) {
             int uv_idx = (x / 2) * 2;
+            int cb = (int)uvrow[uv_idx + 1] - awb_du;  /* Cb 修正 */
+            int cr = (int)uvrow[uv_idx + 0] - awb_dv;  /* Cr 修正 */
+            if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
+            if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
             *dst++ = yrow[x];
-            *dst++ = uvrow[uv_idx + 1];  /* Cb (NV21: 奇数字节) */
-            *dst++ = uvrow[uv_idx];      /* Cr (NV21: 偶数字节) */
+            *dst++ = (uint8_t)cb;
+            *dst++ = (uint8_t)cr;
         }
         JSAMPROW r = row;
         jpeg_write_scanlines(&cinfo, &r, 1);
@@ -460,12 +504,6 @@ static int nv12_to_jpeg(const char *nv12_path, const char *jpeg_path,
 static int capture_and_save_photo(char *out_jpeg, size_t out_len) {
     pthread_mutex_lock(&g_cam_mutex);
 
-    if (mkdir_p(PHOTO_DIR) != 0) {
-        fprintf(stderr, "[cam] mkdir_p %s failed: %s\n", PHOTO_DIR, strerror(errno));
-        pthread_mutex_unlock(&g_cam_mutex);
-        return -1;
-    }
-
     (void)set_camera_controls();   /* 非致命 */
 
     if (capture_nv12_to_file(PHOTO_NV12_TMP) != 0) {
@@ -473,16 +511,10 @@ static int capture_and_save_photo(char *out_jpeg, size_t out_len) {
         return -1;
     }
 
-    char jpeg_path[256];
-    time_t now = time(NULL);
-    struct tm tm_local;
-    localtime_r(&now, &tm_local);
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_local);
-    snprintf(jpeg_path, sizeof(jpeg_path),
-             "%s/photo_%s.jpg", PHOTO_DIR, ts);
+    /* 固定路径，在 tmpfs 上滚动覆盖，不写入 /userdata 持久存储。 */
+    const char *jpeg_path = PHOTO_JPEG_PATH;
 
-    if (nv12_to_jpeg(PHOTO_NV12_TMP, jpeg_path, CAM_WIDTH, CAM_HEIGHT, 95) != 0) {
+    if (nv12_to_jpeg(PHOTO_NV12_TMP, jpeg_path, CAM_WIDTH, CAM_HEIGHT, 90) != 0) {
         pthread_mutex_unlock(&g_cam_mutex);
         return -1;
     }
@@ -491,7 +523,7 @@ static int capture_and_save_photo(char *out_jpeg, size_t out_len) {
     if (out_jpeg && out_len > 0) {
         snprintf(out_jpeg, out_len, "%s", jpeg_path);
     }
-    printf("[cam] photo saved: %s\n", jpeg_path);
+    printf("[cam] photo ready (tmpfs): %s\n", jpeg_path);
 
     pthread_mutex_unlock(&g_cam_mutex);
     return 0;
@@ -605,6 +637,9 @@ static void build_page_widgets(lv_obj_t *container, page_widgets_t *w,
         w->crop_img = lv_img_create(container);
         lv_obj_set_pos(w->crop_img, 460, 120);
         lv_obj_set_size(w->crop_img, 160, 160);
+        /* 初始无 src 时 lv_img 会画绿色 "No data" 占位符，先隐藏；
+         * 等 app_ui_show_crop_b64_jpeg 真正贴上图片再显示。 */
+        lv_obj_add_flag(w->crop_img, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -637,11 +672,12 @@ static const char *function_name(int idx) {
 }
 
 /*
- * 菜单与 lumina 子应用映射（按用户需求）：
- *   HOME_SCENE   (场景单词)  → 多模态百科 (vlm_talking    :8002)
- *   HOME_TALK    (拟境英语)  → 实时翻译   (realtime_translate :8004)
- *   HOME_SEARCH  (拍照搜题)  → 拍照搜题   (homework_finding   :8003)
- *   HOME_ENGLISH (英语对练)  → 后端待接入，目前仅显示页面标题与退出提示
+ * 菜单与 lumina 子应用映射（术语与 scripts/myapp.conf.sample 对齐）：
+ *   HOME_SCENE   (场景单词)  → scene_words        :scene_words_port        默认 8002
+ *   HOME_SEARCH  (拍照搜题)  → photo_search       :photo_search_port       默认 8003
+ *   HOME_TALK    (拟境英语)  → immersive_english  :immersive_english_port  默认 8004
+ *                              路径：/immersive_english
+ *   HOME_ENGLISH (英语对练)  → english_practice   :english_practice_port   默认 8005
  */
 
 typedef struct {
@@ -870,9 +906,12 @@ int main(int argc, char **argv) {
 
     myapp_config_t cfg;
     myapp_config_load(&cfg);
-    app_vlm_configure      (cfg.server_host, cfg.vlm_port);
-    app_translate_configure(cfg.server_host, cfg.translate_port);
-    app_homework_configure (cfg.server_host, cfg.homework_port);
+    /* 模块 API 名 (app_vlm_* / app_translate_* / app_english_*) 沿用旧名以
+     * 避免牵动构建；面向用户/配置的"功能英文名"用新统一术语。 */
+    app_vlm_configure      (cfg.server_host, cfg.scene_words_port);
+    app_homework_configure (cfg.server_host, cfg.photo_search_port);
+    app_translate_configure(cfg.server_host, cfg.immersive_english_port);
+    app_english_configure  (cfg.server_host, cfg.english_practice_port);
 
     /* 用 designated initializer，避免字段顺序变化时悄悄错位 */
     g_apps[HOME_SCENE]  = (app_entry_t){
@@ -883,7 +922,7 @@ int main(int argc, char **argv) {
         .t1_long  = NULL,
         .widgets  = &g_vlm_w,
         .container= ui_SceneWordsContainer,
-        .title    = "多模态百科" };
+        .title    = "场景单词" };
     g_apps[HOME_TALK]   = (app_entry_t){
         .enter    = app_translate_enter,
         .exit     = app_translate_exit,
@@ -903,13 +942,14 @@ int main(int argc, char **argv) {
         .widgets  = &g_hw_w,
         .container= ui_PhotoSearchContainer,
         .title    = "拍照搜题" };
-    /* 英语对练：后端待接入。enter/exit/confirm 全为 NULL，
-     * enter_function 进入时只会切页面，不会调用任何业务回调，
-     * 因此不会崩；install_app_ui 使用 g_ep_w（空 label）。 */
+    /* 英语对练：后端为 english_practice（device-side Silero VAD via ORT）。
+     * Silero 模型在 /oem/etc/silero_vad.ort；libonnxruntime.so 需在
+     * /oem/usr/lib。按电源键开/停对练，VAD 驱动 audio_start/end，摄像头
+     * 会在每轮开口时异步抓一帧可选上传。 */
     g_apps[HOME_ENGLISH] = (app_entry_t){
-        .enter    = NULL,
-        .exit     = NULL,
-        .confirm  = NULL,
+        .enter    = app_english_enter,
+        .exit     = app_english_exit,
+        .confirm  = app_english_on_confirm,
         .t1_short = NULL,
         .t1_long  = NULL,
         .widgets  = &g_ep_w,

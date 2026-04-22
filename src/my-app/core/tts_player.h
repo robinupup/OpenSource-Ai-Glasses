@@ -1,7 +1,7 @@
 /**
  * my-app core - 流式 TTS PCM 播放器
  *
- * 为 realtime_translate 等需要边收边放的 WebSocket 音频流设计：
+ * 为 immersive_english 等需要边收边放的 WebSocket 音频流设计：
  *   1. 收到 {"type":"tts_start",sample_rate,channels,bits,seq} → begin()
  *   2. 收到若干 binary frame（裸 PCM）          → feed(buf, n)
  *   3. 收到 {"type":"tts_end",seq}              → end()  （平滑播完残留）

@@ -132,8 +132,8 @@ static int ensure_ws_open(void) {
     if (g_ws && ws_client_is_open(g_ws)) return 1;
     if (g_ws) { ws_client_close(g_ws); g_ws = NULL; }
     char url[256];
-    myapp_config_build_url(url, sizeof(url), g_host, g_port, "/vlm_talking");
-    printf("[vlm] (re)open %s\n", url);
+    myapp_config_build_url(url, sizeof(url), g_host, g_port, "/scene_words");
+    printf("[scene_words] (re)open %s\n", url);
     g_ws = ws_client_open(url);
     if (!g_ws) { set_status("✕ WS 打开失败"); return 0; }
     ws_client_set_on_msg(g_ws, on_ws, NULL);
@@ -187,7 +187,14 @@ void app_vlm_enter(void) {
 
 void app_vlm_exit(void) {
     stop_mic();
-    if (g_ws) { ws_client_close(g_ws); g_ws = NULL; }
+    if (g_ws) {
+        /* 对齐 scene_words 协议：优雅结束会话再断开 WS */
+        if (ws_client_is_open(g_ws)) {
+            ws_client_send_text(g_ws, "{\"type\":\"end\"}");
+        }
+        ws_client_close(g_ws);
+        g_ws = NULL;
+    }
     pthread_mutex_lock(&g_lock);
     g_state = ST_IDLE;
     pthread_mutex_unlock(&g_lock);
@@ -203,9 +210,10 @@ void app_vlm_on_confirm(void) {
         pthread_mutex_lock(&g_lock);
         g_state = ST_REC;
         pthread_mutex_unlock(&g_lock);
-    } else if (s == ST_REC) {
+    } else {
+        /* ST_REC：停麦即可，服务端 server_vad 会自动检测句尾并触发业务；
+         * scene_words 协议中没有 mic 控制指令，不要再发多余报文。 */
         stop_mic();
-        if (g_ws) ws_client_send_text(g_ws, "{\"type\":\"mic\",\"value\":\"off\"}");
         pthread_mutex_lock(&g_lock);
         g_state = ST_WAIT;
         pthread_mutex_unlock(&g_lock);

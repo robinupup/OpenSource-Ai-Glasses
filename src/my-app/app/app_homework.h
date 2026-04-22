@@ -1,5 +1,5 @@
 /**
- * 拍照搜题控制器 —— ws://host:8003/homework_finding
+ * 拍照搜题（photo_search）控制器 —— ws://host:<photo_search_port>/photo_search
  *
  * 复刻自 lumina_edge 的知识树 + expand 交互：
  *   - 服务端首轮返回 {"nodes":[...]} → 渲染整棵树

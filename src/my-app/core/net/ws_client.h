@@ -2,7 +2,7 @@
  * my-app core/net - WebSocket 客户端封装（基于 mongoose）
  *
  * 用法：
- *   ws_client_t *c = ws_client_open("ws://192.168.1.100:8004/realtime_translate");
+ *   ws_client_t *c = ws_client_open("ws://192.168.1.100:8004/immersive_english");
  *   ws_client_set_on_msg(c, on_msg, ud);
  *   ws_client_send_text(c, "{\"type\":\"mic\",\"value\":\"off\"}");
  *   ws_client_send_binary(c, pcm, pcm_size);

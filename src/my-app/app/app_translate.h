@@ -1,17 +1,33 @@
 /**
- * 实时翻译（英语对练）控制器 —— ws://host:8004/realtime_translate
+ * 拟境英语（immersive_english）控制器 —— ws://host:<immersive_english_port>/immersive_english
+ *
+ * 对齐 x_engine/src/apps/lumina/immersive_english/serve.py 的完整协议：
+ *
+ *   上行（device → cloud）：
+ *     Binary frame                       → PCM 音频（16kHz / mono / 16-bit）
+ *     {"type":"audio","data":"<b64>"}    → 同上，b64 形式（二选一；本端用 binary）
+ *     {"type":"config","tts":bool}       → 运行时开/关 TTS（可选，当前未使用）
+ *     {"type":"end"}                     → 优雅结束会话
+ *
+ *   下行（cloud → device）：
+ *     {"type":"asr","text":...}          → ASR 识别结果（原文）
+ *     {"type":"content","data":...}      → 翻译流式输出
+ *     {"type":"tts_start", sample_rate, format, channels, bits, seq, task_id}
+ *                                        → 本句 TTS 开始，紧跟的 binary 属于此 seq
+ *     Binary frame                       → TTS PCM 数据
+ *     {"type":"tts_end","seq":N}         → 本句 TTS 自然结束
+ *     {"type":"tts_stop","seq":N}        → 本句 TTS 被打断，需立即清空播放缓冲
+ *     {"type":"tts_subtitle","seq":N,"subtitles":[...]}
+ *                                        → 字级时间戳（仅 enable_subtitle=true 时）
+ *     {"type":"done"}                    → 本句翻译完成（连续翻译：服务端不会主动断开）
+ *     {"type":"interrupted"}             → 被新语音打断（随后会收到 tts_stop）
+ *     {"type":"error","data":...}        → 错误
  *
  * 按键语义：
  *   IDLE    → CONFIRM: 连 WS + 开麦，进入 REC
- *   REC     → CONFIRM: 关麦（不发控制帧），等待服务端 VAD 完成翻译
- *   RESULT  → CONFIRM: 再来一轮（回到 IDLE 立刻开麦）
- *   任意    → PAGE:    关 WS，退出回首页
- *
- * 服务端消息处理：
- *   {"type":"asr","text":...}       → 上屏 ASR
- *   {"type":"content","data":...}   → 追加到 content 区
- *   {"type":"done"}                 → 状态置 RESULT
- *   {"type":"interrupted"}          → 状态置 [被打断]
+ *   REC     → CONFIRM: 关麦 + 掐 TTS，不发控制帧（服务端自带 VAD 收尾），进入 WAIT
+ *   WAIT    → 收到 done/interrupted 后 → IDLE（可继续下一轮）
+ *   任意    → PAGE:    发 {"type":"end"} + 关 WS，退出回首页
  */
 #ifndef MYAPP_APP_TRANSLATE_H
 #define MYAPP_APP_TRANSLATE_H

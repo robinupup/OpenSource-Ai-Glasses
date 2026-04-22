@@ -1,12 +1,17 @@
 /**
- * 多模态百科（场景单词）控制器 —— ws://host:8002/vlm_talking
+ * 场景单词（多模态百科）控制器 —— ws://host:8002/scene_words
+ *
+ * 对齐 x_engine/src/apps/lumina/scene_words/serve.py 协议：
+ *   - 上行：二进制 PCM(16k/1ch/16bit) | {type:audio|image|text|uuid|end}
+ *   - 下行：{type:asr|intent|content|image_crop|done|error}
+ *   - 句尾检测：服务端 server_vad 自动检测，客户端只需停止发音频；
+ *     协议中没有 mic 控制指令。
  *
  * 流程：
  *   IDLE    → CONFIRM: 连 WS + 拍照 + 发 {type:uuid}/{type:image} + 开麦 → REC
- *   REC     → CONFIRM: 关麦 + 发 {type:mic,value:off} → WAIT
- *   WAIT    → 收到 image_crop/content/done 后 → RESULT
- *   RESULT  → CONFIRM: 下一轮（自动回 IDLE 并立即开始）
- *   PAGE    → 退出，关 WS
+ *   REC     → CONFIRM: 停麦 → WAIT（服务端 VAD 检测尾包后自动走业务）
+ *   WAIT    → 收到 content/image_crop/done 后 → IDLE（可继续下一轮）
+ *   PAGE    → 退出：发 {type:end} 并关 WS
  */
 #ifndef MYAPP_APP_VLM_H
 #define MYAPP_APP_VLM_H
