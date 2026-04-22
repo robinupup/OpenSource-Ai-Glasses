@@ -425,6 +425,79 @@ static int nv12_to_jpeg(const char *nv12_path, const char *jpeg_path,
         free(y); free(uv); free(row); return -1;
     }
 
+    /*
+     * 软件白平衡：RGB 域灰度世界（Gray-World）
+     * ------------------------------------------------------------------
+     * 背景：RV1103B 的 rkcif 绕过 ISP，Bayer→YUV 没有 AWB，IMX219 sensor 直出
+     *       整体偏绿、Cb/Cr 均值固定偏离 128。
+     * 做法：
+     *   pass 1  每 STEP 像素取一个样本 YCbCr→RGB，累加 R/G/B 均值，
+     *           求 gain_c = mean_gray / mean_c，再限幅 [0.6, 1.6]。
+     *   pass 2  编码循环里 YCbCr→RGB、三路独立乘增益、clip，
+     *           以 JCS_RGB 送 libjpeg。
+     *   相比"仅把 Cb/Cr 平移到 128"的旧版，RGB 通道相对增益也被归一，
+     *   对偏绿/偏蓝/偏黄都更稳健。
+     * 字节序：实测 RV1103B / rkcif 在此路径下实际输出 NV21（V 在前 U 在后），
+     *   即 uvrow[2k]=Cr(V), uvrow[2k+1]=Cb(U)。
+     * YCbCr→RGB 系数：BT.601，16.16 定点。
+     *   R = Y + 1.402 (Cr-128)
+     *   G = Y - 0.344 (Cb-128) - 0.714 (Cr-128)
+     *   B = Y + 1.772 (Cb-128)
+     * ------------------------------------------------------------------ */
+    #define MYAPP_NV_TO_RGB(Y_, U_, V_, R_, G_, B_) do {                \
+        int _cb = (int)(U_) - 128;                                      \
+        int _cr = (int)(V_) - 128;                                      \
+        int _r  = (int)(Y_) + ((91881  * _cr) >> 16);                   \
+        int _g  = (int)(Y_) - ((22554  * _cb + 46802 * _cr) >> 16);     \
+        int _b  = (int)(Y_) + ((116130 * _cb) >> 16);                   \
+        if (_r < 0) _r = 0; else if (_r > 255) _r = 255;                \
+        if (_g < 0) _g = 0; else if (_g > 255) _g = 255;                \
+        if (_b < 0) _b = 0; else if (_b > 255) _b = 255;                \
+        (R_) = (uint8_t)_r; (G_) = (uint8_t)_g; (B_) = (uint8_t)_b;     \
+    } while (0)
+
+    int gain_r_fx = 65536, gain_g_fx = 65536, gain_b_fx = 65536;
+    {
+        const int STEP = 16;          /* 1920x1080 / 16² ≈ 8100 样本，足以稳定均值 */
+        uint64_t sumR = 0, sumG = 0, sumB = 0;
+        uint64_t n = 0;
+        for (int yy = 0; yy < h; yy += STEP) {
+            const uint8_t *yrow  = y  + yy * w;
+            const uint8_t *uvrow = uv + (yy / 2) * w;
+            for (int xx = 0; xx < w; xx += STEP) {
+                int uv_idx = (xx / 2) * 2;
+                uint8_t vv = uvrow[uv_idx + 0];     /* Cr (V) */
+                uint8_t uu = uvrow[uv_idx + 1];     /* Cb (U) */
+                uint8_t R, G, B;
+                MYAPP_NV_TO_RGB(yrow[xx], uu, vv, R, G, B);
+                sumR += R; sumG += G; sumB += B; n++;
+            }
+        }
+        if (n > 0) {
+            double mR = (double)sumR / (double)n;
+            double mG = (double)sumG / (double)n;
+            double mB = (double)sumB / (double)n;
+            /* 极暗 / 极端纯色时跳过，避免灰世界把整张变灰 */
+            if (mR > 4.0 && mG > 4.0 && mB > 4.0) {
+                double mGray = (mR + mG + mB) / 3.0;
+                double gR = mGray / mR;
+                double gG = mGray / mG;
+                double gB = mGray / mB;
+                if (gR < 0.6) gR = 0.6; else if (gR > 1.6) gR = 1.6;
+                if (gG < 0.6) gG = 0.6; else if (gG > 1.6) gG = 1.6;
+                if (gB < 0.6) gB = 0.6; else if (gB > 1.6) gB = 1.6;
+                gain_r_fx = (int)(gR * 65536.0 + 0.5);
+                gain_g_fx = (int)(gG * 65536.0 + 0.5);
+                gain_b_fx = (int)(gB * 65536.0 + 0.5);
+                printf("[cam] AWB gray-world(RGB): mean=(%.1f,%.1f,%.1f) "
+                       "gain=(%.3f,%.3f,%.3f)\n", mR, mG, mB, gR, gG, gB);
+            } else {
+                printf("[cam] AWB skipped: frame too dark (mean=%.1f,%.1f,%.1f)\n",
+                       mR, mG, mB);
+            }
+        }
+    }
+
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr jerr;
     cinfo.err = jpeg_std_error(&jerr);
@@ -434,44 +507,10 @@ static int nv12_to_jpeg(const char *nv12_path, const char *jpeg_path,
     cinfo.image_width      = w;
     cinfo.image_height     = h;
     cinfo.input_components = 3;
-    cinfo.in_color_space   = JCS_YCbCr;
+    cinfo.in_color_space   = JCS_RGB;     /* AWB 后直接以 RGB 送 libjpeg */
     jpeg_set_defaults(&cinfo);
     jpeg_set_quality(&cinfo, quality, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
-
-    /*
-     * 灰度世界（Gray-World）软件白平衡
-     * ------------------------------------------------------------------
-     * 背景：RV1103B 的 rkcif 绕过 ISP，Bayer→YUV 没有 AWB，IMX219 sensor 直出
-     *       的 Cb/Cr 均值固定偏离 128（实测 ~114 / ~114，明显偏绿）。
-     * 做法：先扫一遍 UV 算均值，整体平移使 avg_Cb = avg_Cr = 128，然后在原本
-     *       的 scanline 转换循环里 free-ride 减掉这个偏移。
-     * 开销：pass-1 均值 ≈ 8 ms（见 tools/wb_bench），pass-2 内联 0 额外成本。
-     * ------------------------------------------------------------------
-     * 字节序：实测 RV1103B / rkcif 在此路径下实际输出 NV21（V 在前 U 在后），
-     *         即 uvrow[2k]=Cr(V), uvrow[2k+1]=Cb(U)。
-     *         下面 awb_dv / awb_du 就分别对应这两条通道。 */
-    int awb_dv = 0, awb_du = 0;
-    {
-        uint64_t sV = 0, sU = 0;
-        size_t pairs = uvsize / 2;
-        for (size_t i = 0; i < pairs; i++) {
-            sV += uv[2 * i + 0];  /* byte0: Cr(V) */
-            sU += uv[2 * i + 1];  /* byte1: Cb(U) */
-        }
-        int avg_v = (int)(sV / pairs);
-        int avg_u = (int)(sU / pairs);
-        awb_dv = avg_v - 128;
-        awb_du = avg_u - 128;
-        /* 安全限幅：一次修正不超过 ±32，避免极端场景（比如整张纯色墙）被
-         * 灰度世界错误地强行中和成灰。日常偏色一般就 10~20 之内。 */
-        if (awb_dv >  32) awb_dv =  32;
-        if (awb_dv < -32) awb_dv = -32;
-        if (awb_du >  32) awb_du =  32;
-        if (awb_du < -32) awb_du = -32;
-        printf("[cam] AWB gray-world: avg_Cb=%d avg_Cr=%d → du=%+d dv=%+d\n",
-               avg_u, avg_v, -awb_du, -awb_dv);
-    }
 
     while (cinfo.next_scanline < (JDIMENSION)h) {
         int line = cinfo.next_scanline;
@@ -480,17 +519,25 @@ static int nv12_to_jpeg(const char *nv12_path, const char *jpeg_path,
         uint8_t *dst = row;
         for (int x = 0; x < w; x++) {
             int uv_idx = (x / 2) * 2;
-            int cb = (int)uvrow[uv_idx + 1] - awb_du;  /* Cb 修正 */
-            int cr = (int)uvrow[uv_idx + 0] - awb_dv;  /* Cr 修正 */
-            if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
-            if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
-            *dst++ = yrow[x];
-            *dst++ = (uint8_t)cb;
-            *dst++ = (uint8_t)cr;
+            uint8_t vv = uvrow[uv_idx + 0];     /* Cr (V) */
+            uint8_t uu = uvrow[uv_idx + 1];     /* Cb (U) */
+            uint8_t R, G, B;
+            MYAPP_NV_TO_RGB(yrow[x], uu, vv, R, G, B);
+            int r2 = ((int)R * gain_r_fx) >> 16;
+            int g2 = ((int)G * gain_g_fx) >> 16;
+            int b2 = ((int)B * gain_b_fx) >> 16;
+            if (r2 > 255) r2 = 255;
+            if (g2 > 255) g2 = 255;
+            if (b2 > 255) b2 = 255;
+            *dst++ = (uint8_t)r2;
+            *dst++ = (uint8_t)g2;
+            *dst++ = (uint8_t)b2;
         }
-        JSAMPROW r = row;
-        jpeg_write_scanlines(&cinfo, &r, 1);
+        JSAMPROW rr = row;
+        jpeg_write_scanlines(&cinfo, &rr, 1);
     }
+
+    #undef MYAPP_NV_TO_RGB
 
     jpeg_finish_compress(&cinfo);
     jpeg_destroy_compress(&cinfo);
